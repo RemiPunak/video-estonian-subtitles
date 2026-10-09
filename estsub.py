@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 
 import srt_utils
-from source import get_source
+from source import find_local, get_source
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
 
@@ -31,6 +31,12 @@ def process(video: Path, args: argparse.Namespace) -> None:
         print(f"{out.name} on juba olemas (--force kirjutab üle).")
         return
     print(f"\n=== {video.name} ===")
+
+    if not args.source and (local_et := find_local(video, "et")):
+        et = srt_utils.read_srt(local_et)
+        srt_utils.write_srt(out, [_rewrap(s) for s in et])
+        print(f"Valmis (kohalik eestikeelne {local_et.relative_to(video.parent)}, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
+        return
 
     online_cache = None if args.no_online else {}
     if online_cache is not None and not args.source:

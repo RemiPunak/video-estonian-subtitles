@@ -3,20 +3,68 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 TEXT_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
 EN_LANGS = {"eng", "en", "enm"}
 
 
-def find_sidecar(video: Path) -> Path | None:
-    for suffix in (".en.srt", ".eng.srt", ".english.srt", ".srt"):
-        cand = video.with_name(video.stem + suffix)
-        if cand.exists():
-            return cand
-    return None
+LANG_TOKENS = {"et": {"et", "est", "estonian", "eesti"}, "en": {"en", "eng", "english"}}
+OTHER_LANG_TOKENS = {
+    "fr", "fre", "fra", "french", "de", "ger", "deu", "german", "es", "spa", "spanish", "ru", "rus", "russian",
+    "fi", "fin", "finnish", "sv", "swe", "swedish", "it", "ita", "italian", "pt", "por", "portuguese",
+    "nl", "dut", "dutch", "pl", "pol", "polish", "lv", "lav", "latvian", "lt", "lit", "lithuanian",
+    "da", "dan", "danish", "no", "nor", "norwegian", "chi", "zho", "chinese", "ja", "jpn", "japanese",
+}
+MAX_SUB_DEPTH = 2  # nt Subs/<video nimi>/2_English.srt
+
+
+def _tokens(path: Path) -> set[str]:
+    return set(re.split(r"[^a-z0-9]+", path.stem.lower())) - {""}
+
+
+def find_local(video: Path, lang: str) -> Path | None:
+    """Otsib video kaustast ja alamkaustadest subtiitrit keeles lang ('et'/'en').
+
+    Kaust kuulub videole, kui failinimi algab video nimega, alamkaust kannab video nime
+    või on video kaustas ainus (nt RARBG Subs/2_English.srt).
+    """
+    root = video.parent
+    stem = video.stem.lower()
+    own_output = video.with_name(video.stem + ".et.srt")
+    sole_video = sum(
+        1 for f in root.iterdir() if f.is_file() and f.suffix.lower() in VIDEO_EXT and "sample" not in f.stem.lower()
+    ) <= 1
+    cands = []
+    for f in root.rglob("*.srt"):
+        rel = f.relative_to(root)
+        if len(rel.parts) - 1 > MAX_SUB_DEPTH or f == own_output or "_work" in rel.parts[:-1]:
+            continue
+        in_subdir = len(rel.parts) > 1
+        belongs = (
+            f.name.lower().startswith(stem)
+            or any(p.lower() == stem for p in rel.parts[:-1])
+            or (in_subdir and sole_video)
+        )
+        if not belongs:
+            continue
+        tokens = _tokens(f) - set(re.split(r"[^a-z0-9]+", stem))
+        if tokens & LANG_TOKENS[lang]:
+            explicit = True
+        elif lang == "en" and not tokens & (OTHER_LANG_TOKENS | LANG_TOKENS["et"]) and f.stem.lower() == stem:
+            explicit = False  # Film.srt keeleta: eeldame inglise keelt nagu varem
+        else:
+            continue
+        hearing = bool(tokens & {"sdh", "hi", "cc"})
+        forced = "forced" in tokens
+        cands.append(((not forced, explicit, not hearing, f.stat().st_size), f))
+    if not cands:
+        return None
+    return max(cands, key=lambda c: c[0])[1]
 
 
 def _probe_subs(video: Path) -> list[dict]:
@@ -141,10 +189,10 @@ def get_source(video: Path, work: Path, explicit: Path | None, online_cache: dic
     if explicit:
         print(f"Lähe: {explicit}")
         return explicit
-    if side := find_sidecar(video):
-        print(f"Lähe: kõrvalfail {side.name}")
+    if side := find_local(video, "en"):
+        print(f"Lähe: kohalik fail {side.relative_to(video.parent)}")
         return side
-    print("Kõrvalfaili pole, otsin videost subtiitriradu...")
+    print("Kohalikku ingliskeelset faili pole, otsin videost subtiitriradu...")
     if emb := extract_embedded(video, work):
         return emb
     if online_cache is not None:

@@ -22,10 +22,12 @@ python estsub.py film.mkv --engine deepl              # ilma Claude'ita
 python estsub.py film.mkv --keep-intermediate --force # vahefailid kausta _work/
 ```
 
-**Kõigepealt otsitakse internetist** (OpenSubtitles) valmis eestikeelseid subtiitreid. Leitud fail sünkroonitakse automaatselt videoga: kiirus (PAL 25 fps ↔ 23,976 fps) ja nihe leitakse videos oleva subtiitriraja (ka PGS) või kõnelõikude järgi. Kui sobiv fail leitakse, tõlkimist ei tehta. Lipp `--no-online` lülitab otsingu välja.
+**Kõigepealt otsitakse video kaustast ja alamkaustadest** (kuni 2 taset, nt `Subs/2_English.srt` või `Subs/<video nimi>/…`) eestikeelset `.srt`-faili (`est`, `estonian`, `eesti` nimes). Kui see leitakse, kopeeritakse see `Film.et.srt`-ks ja tõlkimist ei tehta.
+
+Seejärel otsitakse internetist (OpenSubtitles) valmis eestikeelseid subtiitreid. Leitud fail sünkroonitakse automaatselt videoga: kiirus (PAL 25 fps ↔ 23,976 fps) ja nihe leitakse videos oleva subtiitriraja (ka PGS) või kõnelõikude järgi. Kui sobiv fail leitakse, tõlkimist ei tehta. Lipp `--no-online` lülitab otsingu välja.
 
 Kui eestikeelset faili pole, valitakse tõlke lähe järgmises järjekorras:
-1. Video kõrval on `Film.en.srt` või `Film.srt`.
+1. Video kaustas või alamkaustas on ingliskeelne `.srt` (`Film.en.srt`, `Film.srt`, `Subs/2_English.srt`). Eelistatakse mitte-forced ja mitte-SDH faili.
 2. Videos on ingliskeelne tekstipõhine subtiitrirada (SRT, ASS või mov_text). PGS/VobSub pilt-subtiitreid see ei kasuta.
 3. Internetist leitud ingliskeelne subtiiter, mis sünkroonitakse samamoodi.
 4. Kui midagi pole, tuvastab Whisper `large-v3` kõne GPU peal. Esimesel käivitusel laaditakse alla umbes 3 GB mudelit.
