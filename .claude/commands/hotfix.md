@@ -1,0 +1,17 @@
+# /hotfix
+
+Execute the canonical workflow: `.agent/workflows/hotfix.md`
+
+## Required reads before execution
+
+1. `.agent/rules/state_machine.md` — phase transitions
+2. `.agentcortex/context/current_state.md` — SSoT
+
+## Execution
+
+Follow every step in `.agent/workflows/hotfix.md` sequentially.
+The user's task description is: $ARGUMENTS
+
+- Root cause analysis FIRST, then minimal fix.
+- Do NOT skip any phases (research → plan → implement → review → test).
+- End response with ⚡ ACX.

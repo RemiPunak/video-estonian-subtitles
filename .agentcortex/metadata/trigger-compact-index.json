@@ -1,0 +1,475 @@
+{
+  "version": 1,
+  "generated_from": ".agentcortex/metadata/trigger-registry.yaml",
+  "registry_version": 1,
+  "_summary": {
+    "_note": "READ THIS FIRST — scan this flat lookup before reading full entries below. Only read individual entries for skills you need to evaluate.",
+    "bootstrap-recommended-skills": {
+      "load_policy": "always",
+      "cost_risk": "medium",
+      "kind": "workflow",
+      "user_disableable": false
+    },
+    "phase-entry-skill-loading": {
+      "load_policy": "always",
+      "cost_risk": "medium",
+      "kind": "policy",
+      "user_disableable": false
+    },
+    "test-driven-development": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "verification-before-completion": {
+      "load_policy": "phase-entry",
+      "cost_risk": "medium",
+      "kind": "skill",
+      "user_disableable": false
+    },
+    "systematic-debugging": {
+      "load_policy": "on-failure",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "red-team-adversarial": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "api-design": {
+      "load_policy": "on-match",
+      "cost_risk": "medium",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "database-design": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "frontend-patterns": {
+      "load_policy": "on-match",
+      "cost_risk": "medium",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "auth-security": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": false
+    },
+    "doc-lookup": {
+      "load_policy": "on-match",
+      "cost_risk": "low",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "dispatching-parallel-agents": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "subagent-driven-development": {
+      "load_policy": "on-match",
+      "cost_risk": "high",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "using-git-worktrees": {
+      "load_policy": "on-match",
+      "cost_risk": "medium",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "karpathy-principles": {
+      "load_policy": "phase-entry",
+      "cost_risk": "low",
+      "kind": "skill",
+      "user_disableable": true
+    },
+    "production-readiness": {
+      "load_policy": "phase-entry",
+      "cost_risk": "low",
+      "kind": "skill",
+      "user_disableable": true
+    }
+  },
+  "entries": [
+    {
+      "id": "bootstrap-recommended-skills",
+      "kind": "workflow",
+      "phase_scope": [
+        "bootstrap"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "task classification frozen",
+          "recommended skills emitted"
+        ]
+      },
+      "load_policy": "always"
+    },
+    {
+      "id": "phase-entry-skill-loading",
+      "kind": "policy",
+      "phase_scope": [
+        "plan",
+        "implement",
+        "review",
+        "test",
+        "handoff",
+        "ship"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "recommended skills present in work log"
+        ]
+      },
+      "load_policy": "always",
+      "content_hash": "352fde26"
+    },
+    {
+      "id": "test-driven-development",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "testable logic",
+          "core logic",
+          "regression protection"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "762ab7b7"
+    },
+    {
+      "id": "verification-before-completion",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "test",
+        "ship"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ]
+      },
+      "load_policy": "phase-entry",
+      "content_hash": "de3689a7"
+    },
+    {
+      "id": "systematic-debugging",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "unexpected behavior",
+          "bug",
+          "flaky"
+        ],
+        "failure_signals": [
+          "test-failure",
+          "unexpected-behavior",
+          "repeated-patch-failure"
+        ]
+      },
+      "load_policy": "on-failure",
+      "content_hash": "9bee4d30"
+    },
+    {
+      "id": "red-team-adversarial",
+      "kind": "skill",
+      "phase_scope": [
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "hotfix",
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "auth",
+          "permission",
+          "boundary",
+          "dependency"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "22dddc01"
+    },
+    {
+      "id": "api-design",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "api endpoint",
+          "route",
+          "controller",
+          "request validation"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "3bb02b81"
+    },
+    {
+      "id": "database-design",
+      "kind": "skill",
+      "phase_scope": [
+        "plan",
+        "implement",
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "migration",
+          "schema",
+          "table",
+          "index"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "31eb0d40"
+    },
+    {
+      "id": "frontend-patterns",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "ui component",
+          "page",
+          "client state",
+          "form handling"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "209451ab"
+    },
+    {
+      "id": "auth-security",
+      "kind": "skill",
+      "phase_scope": [
+        "plan",
+        "implement",
+        "review",
+        "test"
+      ],
+      "detect_by": {
+        "classification": [
+          "tiny-fix",
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "login",
+          "password",
+          "token",
+          "session",
+          "role",
+          "permission"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "ad3e61e3"
+    },
+    {
+      "id": "doc-lookup",
+      "kind": "skill",
+      "phase_scope": [
+        "implement",
+        "review"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ],
+        "scope_signals": [
+          "framework API",
+          "library usage",
+          "config option",
+          "CLI command",
+          "version-sensitive pattern",
+          "project ADR tech stack"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "6bdb1299"
+    },
+    {
+      "id": "dispatching-parallel-agents",
+      "kind": "skill",
+      "phase_scope": [
+        "implement"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "3+ independent subtasks",
+          "low coupling",
+          "parallelizable modules"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "7d3c724e"
+    },
+    {
+      "id": "subagent-driven-development",
+      "kind": "skill",
+      "phase_scope": [
+        "implement"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "4+ files",
+          "cross-module scope",
+          "interface contracts needed"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "96d1736e"
+    },
+    {
+      "id": "using-git-worktrees",
+      "kind": "skill",
+      "phase_scope": [
+        "bootstrap",
+        "implement"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "parallel branch isolation",
+          "separate branch workspace",
+          "avoid branch switching"
+        ]
+      },
+      "load_policy": "on-match",
+      "content_hash": "c214b6f8"
+    },
+    {
+      "id": "karpathy-principles",
+      "kind": "skill",
+      "phase_scope": [
+        "plan",
+        "implement",
+        "review"
+      ],
+      "detect_by": {
+        "classification": [
+          "quick-win",
+          "feature",
+          "architecture-change",
+          "hotfix"
+        ]
+      },
+      "load_policy": "phase-entry",
+      "content_hash": "d599b962"
+    },
+    {
+      "id": "production-readiness",
+      "kind": "skill",
+      "phase_scope": [
+        "review",
+        "ship"
+      ],
+      "detect_by": {
+        "classification": [
+          "feature",
+          "architecture-change"
+        ],
+        "scope_signals": [
+          "error handling",
+          "logging",
+          "crash reporting",
+          "observability",
+          "new API endpoint",
+          "new service class",
+          "new background job"
+        ]
+      },
+      "load_policy": "phase-entry",
+      "content_hash": "18e63ee1"
+    }
+  ]
+}

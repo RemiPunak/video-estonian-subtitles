@@ -28,10 +28,11 @@ def translate(texts: dict[int, str]) -> dict[int, str]:
         chunk = ids[start : start + BATCH]
         prev = ids[max(0, start - CONTEXT_LINES) : start]
         context = " ".join(texts[i] for i in prev) or None
+        xml_context = html.escape(context, quote=False) if context else None  # tag_handling=xml parsib ka konteksti
         xml = "".join(f'<c id="{i}">{html.escape(texts[i], quote=False)}</c>' for i in chunk)
         res = tr.translate_text(
             xml, source_lang="EN", target_lang="ET", tag_handling="xml",
-            context=context, preserve_formatting=True,
+            context=xml_context, preserve_formatting=True,
             outline_detection=False, split_sentences="nonewlines",
         )
         got = {int(m.group(1)): html.unescape(m.group(2)).strip() for m in _SEG_RE.finditer(res.text)}

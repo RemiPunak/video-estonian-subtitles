@@ -5,3 +5,36 @@ _work/
 *.sub
 *.wav
 .env
+
+
+# Agentic OS Template - Downstream Ignore Defaults
+
+# Runtime State (work logs are session-local; private is never committed)
+.agentcortex/context/work/*.md
+.agentcortex/context/work/*.lock.json
+!.agentcortex/context/work/.gitkeep.md
+.agentcortex/context/.guard_receipt.json
+.agentcortex/context/.guard_receipts/
+.agentcortex/context/.guard_locks/
+.agentcortex/context/private/
+.agent/private/
+
+# Deploy Artifacts
+.agentcortex-src/
+*.acx-incoming
+*.acx-local
+
+# Per-Operator Tool State (this project's .claude/settings.json declares
+# settings.local.json user-local; keep git agreeing with that declaration)
+.claude/settings.local.json
+
+# Third-party AI Tool Local State
+.openrouter/
+.claude-chat/
+.antigravity/scratch/
+
+# Framework Tool Bytecode (framework namespace only; project policy untouched)
+.agentcortex/**/__pycache__/
+
+# End Agentic OS Template - Downstream Ignore Defaults
+

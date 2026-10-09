@@ -1,0 +1,4 @@
+{
+  "_comment": "Project-shared Claude Code config. User-local permissions live in settings.local.json.",
+  "_governance_ref": "Sentinel and Phase Summary enforcement is model self-attestation per AGENTS.md — no Python hooks shipped, keeping downstream zero-runtime-dep. Audit trail: Work Log Phase Summary + archived Work Logs reviewed by validate.sh."
+}

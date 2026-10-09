@@ -1,0 +1,3121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# (#211) The Python tools this script runs would print in the console code page (cp950
+# renders an em dash as A1 58) while this script prints UTF-8; keep one encoding.
+export PYTHONIOENCODING=utf-8
+
+# --- CLI flags ---
+ACX_NO_PYTHON=0
+LIST_CHECKS_ONLY=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --no-python) ACX_NO_PYTHON=1 ;;
+    --list-checks|-l) LIST_CHECKS_ONLY=1 ;;
+  esac
+done
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PLATFORM_DOC="$ROOT/.agentcortex/docs/CODEX_PLATFORM_GUIDE.md"
+CLAUDE_PLATFORM_DOC="$ROOT/.agentcortex/docs/CLAUDE_PLATFORM_GUIDE.md"
+EXAMPLES_DOC="$ROOT/.agentcortex/docs/PROJECT_EXAMPLES.md"
+PROJECT_AGENTS_FILE="$ROOT/AGENTS.md"
+PROJECT_CLAUDE_FILE="$ROOT/CLAUDE.md"
+WORKFLOWS_DIR="$ROOT/.agent/workflows"
+CLAUDE_COMMANDS_DIR="$ROOT/.claude/commands"
+CODEX_INSTALL="$ROOT/.codex/INSTALL.md"
+CODEX_RULES="$ROOT/.codex/rules/default.rules"
+CANONICAL_DEPLOY_SH="$ROOT/.agentcortex/bin/deploy.sh"
+
+# Source-repo detection (must run before required_files array is built).
+# Source repo has canonical deploy but no .agentcortex-manifest.
+# Both source and downstream repos keep deploy_brain.* under installers/.
+IS_SOURCE_REPO=0
+if [[ -f "$CANONICAL_DEPLOY_SH" ]] && [[ ! -f "$ROOT/.agentcortex-manifest" ]]; then
+  IS_SOURCE_REPO=1
+fi
+
+ROOT_DEPLOY_SH="$ROOT/installers/deploy_brain.sh"
+ROOT_DEPLOY_PS1="$ROOT/installers/deploy_brain.ps1"
+ROOT_DEPLOY_CMD="$ROOT/installers/deploy_brain.cmd"
+CANONICAL_DEPLOY_PS1="$ROOT/.agentcortex/bin/deploy.ps1"
+CANONICAL_VALIDATE_SH="$ROOT/.agentcortex/bin/validate.sh"
+CANONICAL_VALIDATE_PS1="$ROOT/.agentcortex/bin/validate.ps1"
+TEXT_INTEGRITY_CHECK_PY="$ROOT/.agentcortex/tools/check_text_integrity.py"
+TEXT_INTEGRITY_CHECK_PS1="$ROOT/.agentcortex/tools/check_text_integrity.ps1"
+TEXT_INTEGRITY_BASELINE="$ROOT/.agentcortex/tools/text_integrity_baseline.txt"
+TRIGGER_METADATA_VALIDATOR="$ROOT/.agentcortex/tools/validate_trigger_metadata.py"
+TRIGGER_COMPACT_INDEX_GENERATOR="$ROOT/.agentcortex/tools/generate_compact_index.py"
+GUARD_CONTEXT_WRITE="$ROOT/.agentcortex/tools/guard_context_write.py"
+GUARDED_WRITES_LINT="$ROOT/.agentcortex/tools/lint_governed_writes.py"
+LIFECYCLE_FRONTMATTER_CHECK="$ROOT/.agentcortex/tools/check_lifecycle_frontmatter.py"
+AUDIT_CHAIN_CHECK="$ROOT/.agentcortex/tools/check_audit_chain.py"
+ARCHIVE_INDEX_JSONL="$ROOT/.agentcortex/context/archive/INDEX.jsonl"
+LESSON_CHAIN_CHECK="$ROOT/.agentcortex/tools/check_lesson_chain.py"
+SSOT_CURRENT_STATE="$ROOT/.agentcortex/context/current_state.md"
+COMMAND_SYNC_CHECK="$ROOT/.agentcortex/tools/check_command_sync.py"
+ROUTING_ACTIONS_CHECK="$ROOT/.agentcortex/tools/check_routing_actions.py"
+SKILL_PROVENANCE_CHECK="$ROOT/.agentcortex/tools/check_skill_provenance.py"
+TRIGGER_REGISTRY="$ROOT/.agentcortex/metadata/trigger-registry.yaml"
+TRIGGER_COMPACT_INDEX="$ROOT/.agentcortex/metadata/trigger-compact-index.json"
+LIFECYCLE_SCENARIOS="$ROOT/.agentcortex/metadata/lifecycle-scenarios.json"
+SKILL_CONFLICT_MATRIX="$ROOT/.agent/rules/skill_conflict_matrix.md"
+AGENT_CONFIG_YAML="$ROOT/.agent/config.yaml"
+OPTIONAL_GUARD_HOOK="$ROOT/.githooks/pre-commit.guard-ssot.sample"
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+SKIP_COUNT=0
+# Referenced-but-absent tools with NO stated reason. A deliberate source-only absence names
+# itself via ACX_ABSENT_REASON and does not count; an unnamed one is an accident and
+# qualifies the summary line, which otherwise reports an unconditional pass.
+TOOL_ABSENT_UNEXPECTED=0
+ACX_ABSENT_REASON=""
+
+record_result() {
+  local level="$1"
+  shift
+  local message="$*"
+  printf '[%s] %s\n' "$level" "$message"
+  case "$level" in
+    PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+    WARN) WARN_COUNT=$((WARN_COUNT + 1)) ;;
+    FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
+    SKIP) SKIP_COUNT=$((SKIP_COUNT + 1)) ;;
+  esac
+}
+
+print_indented_output() {
+  local text="${1:-}"
+  [[ -n "$text" ]] || return 0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '  %s\n' "$line"
+  done <<< "$text"
+}
+
+check_file_group() {
+  local label="$1"
+  shift
+  local missing=()
+  local f
+  for f in "$@"; do
+    [[ -f "$f" ]] || missing+=("$f")
+  done
+  if ((${#missing[@]})); then
+    record_result FAIL "$label"
+    for f in "${missing[@]}"; do
+      printf '  missing: %s\n' "$f"
+    done
+    printf '  fix: re-run deploy (installers/deploy_brain.sh) to restore missing framework files\n'
+  else
+    record_result PASS "$label"
+  fi
+}
+
+check_optional_file_group() {
+  local label="$1"
+  shift
+  local missing=()
+  local f
+  for f in "$@"; do
+    [[ -f "$f" ]] || missing+=("$f")
+  done
+  if ((${#missing[@]})); then
+    record_result WARN "$label"
+    for f in "${missing[@]}"; do
+      printf '  missing (optional): %s\n' "$f"
+    done
+  else
+    record_result PASS "$label"
+  fi
+}
+
+check_dir_group() {
+  local label="$1"
+  shift
+  local missing=()
+  local d
+  for d in "$@"; do
+    [[ -d "$d" ]] || missing+=("$d")
+  done
+  if ((${#missing[@]})); then
+    record_result FAIL "$label"
+    for d in "${missing[@]}"; do
+      printf '  missing: %s\n' "$d"
+    done
+    printf '  fix: re-run deploy (installers/deploy_brain.sh) to restore missing framework directories\n'
+  else
+    record_result PASS "$label"
+  fi
+}
+
+check_contains_literal() {
+  local file="$1"
+  local pattern="$2"
+  local success="$3"
+  local failure="$4"
+  if grep -F -q -- "$pattern" "$file"; then
+    record_result PASS "$success"
+  else
+    record_result FAIL "$failure"
+  fi
+}
+
+check_contains_regex() {
+  local file="$1"
+  local pattern="$2"
+  local success="$3"
+  local failure="$4"
+  if grep -q -- "$pattern" "$file"; then
+    record_result PASS "$success"
+  else
+    record_result FAIL "$failure"
+  fi
+}
+
+run_python_check() {
+  local label="$1"
+  local missing_python_level="$2"
+  local script="$3"
+  shift 3
+
+  if [[ ! -f "$script" ]]; then
+    if [[ -z "${ACX_ABSENT_REASON:-}" ]]; then
+      TOOL_ABSENT_UNEXPECTED=$((TOOL_ABSENT_UNEXPECTED + 1))
+    fi
+    record_result SKIP "$label -- ${ACX_ABSENT_REASON:-tool not present}"
+    return 0
+  fi
+
+  if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ "$ACX_NO_PYTHON" -eq 1 ]]; then
+      record_result SKIP "$label -- python checks disabled (--no-python)"
+    else
+      record_result WARN "$label -- python unavailable (install Python 3.9+ for full validation)"
+    fi
+    return 0
+  fi
+
+  local output
+  local status=0
+  output="$("$PYTHON_BIN" "$script" "$@" 2>&1)" || status=$?
+  if [[ $status -eq 0 ]]; then
+    record_result PASS "$label"
+  else
+    record_result FAIL "$label"
+  fi
+  print_indented_output "$output"
+}
+
+# Same contract as run_python_check, for a tool deploy.sh deliberately does not ship.
+# The reason travels with the call site -- the only place a reader looks -- instead of a
+# separate registry, and "unexpected" stays defined as an absence with NO stated reason
+# rather than as absence from a list that can go stale. Set-and-clear is structural here
+# so a caller cannot leak the reason onto the next check.
+run_python_check_source_only() {
+  local reason="$1"
+  shift
+  ACX_ABSENT_REASON="$reason"
+  run_python_check "$@"
+  ACX_ABSENT_REASON=""
+}
+
+required_files=(
+  "$WORKFLOWS_DIR/hotfix.md"
+  "$WORKFLOWS_DIR/worktree-first.md"
+  "$WORKFLOWS_DIR/govern-docs.md"
+  "$WORKFLOWS_DIR/handoff.md"
+  "$WORKFLOWS_DIR/bootstrap.md"
+  "$WORKFLOWS_DIR/plan.md"
+  "$WORKFLOWS_DIR/implement.md"
+  "$WORKFLOWS_DIR/review.md"
+  "$WORKFLOWS_DIR/help.md"
+  "$WORKFLOWS_DIR/test-skeleton.md"
+  "$WORKFLOWS_DIR/commands.md"
+  "$WORKFLOWS_DIR/routing.md"
+  "$WORKFLOWS_DIR/test.md"
+  "$WORKFLOWS_DIR/ship.md"
+  "$WORKFLOWS_DIR/decide.md"
+  "$WORKFLOWS_DIR/test-classify.md"
+  "$WORKFLOWS_DIR/spec-intake.md"
+  "$WORKFLOWS_DIR/adr.md"
+  "$WORKFLOWS_DIR/audit.md"
+  "$WORKFLOWS_DIR/brainstorm.md"
+  "$WORKFLOWS_DIR/research.md"
+  "$WORKFLOWS_DIR/retro.md"
+  "$WORKFLOWS_DIR/spec.md"
+  "$WORKFLOWS_DIR/sync-docs.md"
+  "$SKILL_CONFLICT_MATRIX"
+  "$AGENT_CONFIG_YAML"
+  "$PLATFORM_DOC"
+  "$CLAUDE_PLATFORM_DOC"
+  "$EXAMPLES_DOC"
+  "$PROJECT_AGENTS_FILE"
+  "$PROJECT_CLAUDE_FILE"
+  "$ROOT_DEPLOY_SH"
+  "$ROOT_DEPLOY_PS1"
+  "$ROOT_DEPLOY_CMD"
+  "$CANONICAL_DEPLOY_SH"
+  "$CANONICAL_DEPLOY_PS1"
+  "$CANONICAL_VALIDATE_SH"
+  "$CANONICAL_VALIDATE_PS1"
+  "$COMMAND_SYNC_CHECK"
+  "$TEXT_INTEGRITY_CHECK_PY"
+  "$TEXT_INTEGRITY_CHECK_PS1"
+  "$TEXT_INTEGRITY_BASELINE"
+)
+
+claude_required_files=(
+  "$CLAUDE_COMMANDS_DIR/spec-intake.md"
+  "$CLAUDE_COMMANDS_DIR/bootstrap.md"
+  "$CLAUDE_COMMANDS_DIR/plan.md"
+  "$CLAUDE_COMMANDS_DIR/implement.md"
+  "$CLAUDE_COMMANDS_DIR/review.md"
+  "$CLAUDE_COMMANDS_DIR/test.md"
+  "$CLAUDE_COMMANDS_DIR/handoff.md"
+  "$CLAUDE_COMMANDS_DIR/ship.md"
+  "$CLAUDE_COMMANDS_DIR/decide.md"
+  "$CLAUDE_COMMANDS_DIR/test-classify.md"
+  "$CLAUDE_COMMANDS_DIR/claude-cli.md"
+  "$ROOT/.claude/agents/acx-implementer.md"
+  "$ROOT/.claude/agents/acx-reviewer.md"
+  "$ROOT/.claude/agents/acx-tester.md"
+  "$ROOT/.claude/agents/acx-handoff.md"
+  "$ROOT/.claude/agents/acx-shipper.md"
+)
+
+required_dirs=(
+  "$WORKFLOWS_DIR"
+  "$CLAUDE_COMMANDS_DIR"
+  "$ROOT/.agents/skills"
+  "$ROOT/.agent/skills"
+)
+
+# Python discovery by STARTABILITY, not mere existence (#144). On stock Windows,
+# %LOCALAPPDATA%\Microsoft\WindowsApps\python3.exe is an App Execution Alias stub
+# that EXISTS on PATH even with no Python installed; invoked with args it prints
+# "Python was not found" and exits 9009 (it does NOT open the Store UI when given
+# args). An existence-only check would select that broken stub and shadow a
+# working `python`, so every python-backed check would spuriously fail. Probe
+# each candidate (python3 then python) with a silent `-c "import sys"` and select
+# only the first that starts and exits 0. --no-python short-circuits before any
+# probe; neither candidate startable leaves PYTHON_BIN empty (SKIP/WARN/reduced-
+# assurance behavior unchanged).
+if [[ "$ACX_NO_PYTHON" -eq 1 ]]; then
+  PYTHON_BIN=
+else
+  PYTHON_BIN=
+  for _py_candidate in python3 python; do
+    if command -v "$_py_candidate" >/dev/null 2>&1 \
+      && "$_py_candidate" -c "import sys" >/dev/null 2>&1; then
+      PYTHON_BIN="$_py_candidate"
+      break
+    fi
+  done
+  unset _py_candidate
+fi
+
+if [[ "$LIST_CHECKS_ONLY" -eq 1 ]]; then
+  grep -oE 'record_result (PASS|FAIL|WARN|SKIP) "[^"]*"' "$0" \
+    | sed 's/record_result [A-Z]* "//; s/"$//' \
+    | grep -v '^\$' \
+    | sort -u
+  exit 0
+fi
+
+check_file_group "required framework files present" "${required_files[@]}"
+
+check_optional_file_group "optional module workflow files present" \
+  "$WORKFLOWS_DIR/ask-openrouter.md" \
+  "$WORKFLOWS_DIR/codex-cli.md" \
+  "$WORKFLOWS_DIR/claude-cli.md" \
+  "$WORKFLOWS_DIR/ask-local.md"
+
+deprecated_files=("$WORKFLOWS_DIR/new-feature.md" "$WORKFLOWS_DIR/medium-feature.md" "$WORKFLOWS_DIR/small-fix.md")
+deprecated_found=()
+for f in "${deprecated_files[@]}"; do
+  [[ -f "$f" ]] && deprecated_found+=("$(basename "$f")")
+done
+if [[ ${#deprecated_found[@]} -gt 0 ]]; then
+  record_result FAIL "deprecated workflow files still present (remove them): ${deprecated_found[*]}"
+else
+  record_result PASS "deprecated workflow files absent (new-feature, medium-feature, small-fix)"
+fi
+
+if [[ "$IS_SOURCE_REPO" -eq 1 ]]; then
+  record_result SKIP "claude adapter files -- source repo (created by deploy in downstream)"
+  # Adjust required_dirs to exclude .claude/commands in source repo
+  source_required_dirs=(
+    "$WORKFLOWS_DIR"
+    "$ROOT/.agents/skills"
+    "$ROOT/.agent/skills"
+  )
+  check_dir_group "required framework directories present" "${source_required_dirs[@]}"
+else
+  check_file_group "claude adapter files present" "${claude_required_files[@]}"
+  check_dir_group "required framework directories present" "${required_dirs[@]}"
+fi
+
+run_python_check \
+  "text integrity check" \
+  FAIL \
+  "$TEXT_INTEGRITY_CHECK_PY" \
+  --root "$ROOT" \
+  --baseline "$TEXT_INTEGRITY_BASELINE"
+
+if [[ -f "$TRIGGER_REGISTRY" ]]; then
+  if [[ -f "$TRIGGER_COMPACT_INDEX" ]]; then
+    record_result PASS "metadata runtime artifacts present"
+  else
+    record_result FAIL "metadata runtime incomplete -- missing trigger-compact-index.json"
+    echo "  fix: re-run deploy to restore metadata, or regenerate with .agentcortex/tools/generate_compact_index.py"
+  fi
+
+  if [[ -f "$TRIGGER_METADATA_VALIDATOR" ]]; then
+    if [[ -f "$LIFECYCLE_SCENARIOS" ]]; then
+      run_python_check "metadata deep validation" FAIL "$TRIGGER_METADATA_VALIDATOR" --root "$ROOT"
+    else
+      record_result FAIL "metadata deep validation unavailable -- lifecycle scenarios missing"
+      echo "  fix: re-run deploy to restore .agentcortex/metadata/lifecycle-scenarios.json"
+    fi
+  else
+    record_result SKIP "metadata deep checks -- CI-only validator not deployed (safe to ignore downstream)"
+  fi
+
+  if [[ -f "$TRIGGER_COMPACT_INDEX_GENERATOR" ]]; then
+    run_python_check "compact index freshness" FAIL "$TRIGGER_COMPACT_INDEX_GENERATOR" --root "$ROOT" --check
+  else
+    record_result SKIP "compact index freshness -- CI-only generator not deployed (safe to ignore downstream)"
+  fi
+elif [[ -f "$TRIGGER_COMPACT_INDEX" ]]; then
+  record_result FAIL "metadata runtime incomplete -- compact index present without trigger registry"
+  echo "  fix: re-run deploy to restore .agentcortex/metadata/trigger-registry.yaml"
+else
+  record_result SKIP "metadata checks -- no trigger registry found (safe to ignore if not using skill metadata)"
+fi
+
+run_python_check "command sync check" FAIL "$COMMAND_SYNC_CHECK" --root "$ROOT"
+
+# Guarded-write lint: fail CI on direct file writes against
+# .agent/config.yaml §guard_policy.protected_paths. Use guard_context_write.py
+# or annotate the line with `guard-exempt: <reason>`.
+run_python_check "guarded-write lint (governance paths)" FAIL "$GUARDED_WRITES_LINT" --root "$ROOT"
+
+# Governance docs MUST declare lifecycle: frontmatter
+# {owner, review_cadence, review_trigger, supersedes, superseded_by}.
+# Files dated before 2026-04-25 are grandfathered (WARN); newer files FAIL.
+run_python_check "lifecycle frontmatter (governance docs)" FAIL "$LIFECYCLE_FRONTMATTER_CHECK" --root "$ROOT"
+
+# Skill provenance + compatibility floor (backlog #80/#81). Source-repo only:
+# the tool self-skips downstream when a .agentcortex-manifest is present, and as
+# a CI/source validator it is not in deploy.sh runtime_tools, so it is simply
+# absent downstream -> run_python_check records a graceful SKIP.
+run_python_check_source_only "source-only tool, not deployed by design (safe to ignore downstream)" \
+  "skill provenance + compatibility floor" FAIL "$SKILL_PROVENANCE_CHECK" --root "$ROOT"
+
+# Verify the hash chain on the archive INDEX.jsonl. A broken chain means an
+# entry was retroactively rewritten without going through
+# .agentcortex/tools/append_chain_entry.py. Capability-by-presence: file
+# absent or empty → no-op (PASS). External observer for an otherwise
+# honor-system rule on archive integrity.
+if [[ -f "$ARCHIVE_INDEX_JSONL" ]]; then
+  run_python_check "audit chain integrity (INDEX.jsonl)" FAIL "$AUDIT_CHAIN_CHECK" --path "$ARCHIVE_INDEX_JSONL" --quiet
+else
+  record_result SKIP "audit chain integrity -- archive INDEX.jsonl not present"
+fi
+
+# D4: INDEX.jsonl referenced-file existence. The hash chain + git witness above
+# prove entries are append-only and unedited, but neither verifies that each
+# entry's `log` artifact still exists on disk — a DANGLING reference (entry
+# present, file gone) is an integrity gap the chain cannot see. WARN, not FAIL:
+# a genuine historical dangling ref cannot be cleanly removed (append-only chain
+# + git witness forbid entry deletion), so this SURFACES the gap for review
+# rather than blocking. Capability-by-presence; needs Python for robust JSON.
+if [[ -f "$ARCHIVE_INDEX_JSONL" ]] && [[ -n "$PYTHON_BIN" ]]; then
+  _acx_index_refs_py=$(cat <<'PYEOF'
+import json, os, sys
+archive = os.path.dirname(os.path.abspath(sys.argv[1]))
+missing = []
+seen = 0
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            log = entry.get("log")
+            if not log:
+                continue
+            seen += 1
+            cands = [os.path.join(archive, log), os.path.join(archive, "work", log)]
+            if not any(os.path.exists(c) for c in cands):
+                missing.append(log)
+except OSError:
+    print("error")
+    sys.exit(0)
+print(("missing:" + ",".join(missing)) if missing else ("ok:%d" % seen))
+PYEOF
+)
+  index_refs_result="$("$PYTHON_BIN" -c "$_acx_index_refs_py" "$ARCHIVE_INDEX_JSONL" 2>/dev/null)"
+  index_refs_level=PASS
+  index_refs_msg="INDEX.jsonl referenced logs all present on disk (${index_refs_result#ok:} checked)"
+  if [[ "$index_refs_result" == missing:* ]]; then
+    _acx_dangling="${index_refs_result#missing:}"
+    _acx_dangling_count="$(printf '%s' "$_acx_dangling" | tr ',' '\n' | grep -c '.')"
+    printf '  INDEX.jsonl references %s file(s) not present on disk: %s\n' "$_acx_dangling_count" "$_acx_dangling"
+    index_refs_level=WARN
+    index_refs_msg="INDEX.jsonl referenced logs missing on disk: ${_acx_dangling_count} (dangling audit reference)"
+  fi
+  record_result "$index_refs_level" "$index_refs_msg"
+fi
+
+# C1: git append-only WITNESS for INDEX.jsonl (ADR-003 amendment; spec
+# audit-chain-tamper-evidence AC-4/5/6). The back-linked chain above cannot
+# detect TAIL-TRUNCATION (deleting the most recent entries leaves a chain that
+# still validates). Git is used as an EXTERNAL append-only witness: the
+# INDEX.jsonl committed at the merge-base with origin/main MUST be a line-prefix
+# of the working copy. merge-base (not the origin tip) avoids false FAILs on
+# stale feature branches while still catching any deletion/edit of an entry that
+# existed when this branch diverged. Tamper-EVIDENCE, not prevention: a truncation
+# becomes a visible removed-lines diff that must survive PR review. Degrades to
+# WARN (never silent PASS) when git / origin/main / baseline is unavailable.
+INDEX_REL=".agentcortex/context/archive/INDEX.jsonl"
+if [[ -f "$ARCHIVE_INDEX_JSONL" ]]; then
+  if ! command -v git >/dev/null 2>&1 || ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    record_result WARN "INDEX.jsonl append-only witness -- git unavailable or not a git repo"
+  else
+    # Best-effort: make origin/main available (no-op when offline / no remote).
+    if ! git -C "$ROOT" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+      git -C "$ROOT" fetch -q --depth=1 origin main >/dev/null 2>&1 || true
+    fi
+    witness_base="$(git -C "$ROOT" merge-base origin/main HEAD 2>/dev/null || true)"
+    if [[ -z "$witness_base" ]]; then
+      record_result WARN "INDEX.jsonl append-only witness -- no merge-base with origin/main (offline, no remote, or unrelated history)"
+    elif ! git -C "$ROOT" cat-file -e "$witness_base:$INDEX_REL" 2>/dev/null; then
+      record_result WARN "INDEX.jsonl append-only witness -- not present at merge-base (new log surface)"
+    else
+      # Normalize both sides identically before comparing, so this check is
+      # byte-for-byte equivalent to the validate.ps1 mirror (parity, spec AC-6):
+      #   1. tr -d '\r' — the working copy may be CRLF (git autocrlf on Windows)
+      #      while `git show` emits LF; an un-normalized diff false-FAILs every
+      #      line. (`tr` is portable; diff --strip-trailing-cr is GNU-only.)
+      #   2. grep '.' — drop blank lines, matching the PowerShell mirror's
+      #      `Where-Object { $_ -ne '' }`, so a stray blank line cannot make the
+      #      two validators disagree.
+      witness_base_count="$(git -C "$ROOT" show "$witness_base:$INDEX_REL" | tr -d '\r' | grep -c '.' || true)"
+      witness_local_count="$(tr -d '\r' < "$ARCHIVE_INDEX_JSONL" | grep -c '.' || true)"
+      if [[ "$witness_local_count" -lt "$witness_base_count" ]]; then
+        record_result FAIL "INDEX.jsonl append-only witness -- local has $witness_local_count entries, fewer than baseline $witness_base_count at merge-base (tail-truncation?)"
+      elif ! diff -q <(git -C "$ROOT" show "$witness_base:$INDEX_REL" | tr -d '\r' | grep '.') <(tr -d '\r' < "$ARCHIVE_INDEX_JSONL" | grep '.' | head -n "$witness_base_count") >/dev/null 2>&1; then
+        record_result FAIL "INDEX.jsonl append-only witness -- committed baseline is not a prefix of local (a previously-published audit entry was edited or deleted)"
+      else
+        record_result PASS "INDEX.jsonl append-only witness -- baseline is a prefix of local (append-only invariant holds)"
+      fi
+    fi
+  fi
+fi
+
+# Global Lessons hash chain. Without a chain, an agent could silently delete
+# an inconvenient lesson that constrains its own future behaviour. Tamper-
+# evident chain on §Global Lessons closes that gap.
+if [[ -f "$SSOT_CURRENT_STATE" ]]; then
+  run_python_check "lesson chain integrity (Global Lessons)" FAIL "$LESSON_CHAIN_CHECK" --path "$SSOT_CURRENT_STATE" --quiet
+else
+  record_result SKIP "lesson chain integrity -- current_state.md not present"
+fi
+
+# Unresolved merge-conflict markers in tracked files. A squash-merge collision
+# between two PRs that both edit the same section (e.g. SSoT Ship History) can
+# leave conflict markers committed to a tracked file -- git's own merge blocks
+# this, but GitHub squash-merge does not (current_state.md reached main this way
+# on 2026-05-31; fixed in PR #130). Match only the unambiguous opening/closing
+# marker forms ("<<<<<<< " / ">>>>>>> " at line start); a bare "=======" is
+# deliberately NOT matched because it collides with markdown setext H2 underlines.
+# The validator pair self-excludes (it contains the pattern literally). git grep
+# -I skips binary; the verdict is byte-identical to the validate.ps1 mirror.
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  conflict_marker_hits="$(git -C "$ROOT" grep -I -n -E '^(<<<<<<< |>>>>>>> )' -- . \
+    ':(exclude).agentcortex/bin/validate.sh' \
+    ':(exclude).agentcortex/bin/validate.ps1' \
+    ':(exclude)tests/guard/test_conflict_markers.py' 2>/dev/null || true)"
+  if [[ -n "$conflict_marker_hits" ]]; then
+    record_result FAIL "unresolved merge-conflict markers in tracked files"
+    print_indented_output "$conflict_marker_hits"
+  else
+    record_result PASS "no unresolved merge-conflict markers in tracked files"
+  fi
+else
+  record_result WARN "merge-conflict marker scan -- git unavailable or not a git repo"
+fi
+
+if [[ -f "$ROOT/tools/audit_ai_paths.sh" ]]; then
+  record_result FAIL "legacy audit helper should move under .agentcortex/tools/: $ROOT/tools/audit_ai_paths.sh"
+else
+  record_result PASS "legacy audit helper not present at tools/audit_ai_paths.sh"
+fi
+
+skill_errors=0
+for skill_file in "$ROOT"/.agent/skills/*; do
+  [[ -f "$skill_file" ]] || continue
+  skill_name="$(basename "$skill_file")"
+  [[ "$skill_name" == ".gitkeep" ]] && continue
+  codex_skill_path="$ROOT/.agents/skills/$skill_name"
+  if [[ ! -s "$skill_file" ]]; then
+    printf '  empty skill metadata: %s\n' "$skill_file"
+    skill_errors=$((skill_errors + 1))
+  fi
+  if [[ ! -d "$codex_skill_path" ]]; then
+    printf '  missing codex skill dir: %s\n' "$codex_skill_path"
+    skill_errors=$((skill_errors + 1))
+  elif [[ ! -f "$codex_skill_path/SKILL.md" ]]; then
+    printf '  missing skill definition: %s/SKILL.md\n' "$codex_skill_path"
+    skill_errors=$((skill_errors + 1))
+  fi
+done
+if [[ "$skill_errors" -gt 0 ]]; then
+  record_result FAIL "skill metadata mirrors out of sync"
+else
+  record_result PASS "skill metadata mirrors are consistent"
+fi
+
+if [[ "$IS_SOURCE_REPO" -eq 1 ]]; then
+  record_result SKIP "legacy rule surfaces -- source repo (adapter surfaces created by deploy)"
+else
+  check_file_group "legacy rule surfaces present" \
+    "$ROOT/.antigravity/rules.md" \
+    "$ROOT/.agent/rules/rules.md" \
+    "$CODEX_INSTALL"
+
+  check_contains_regex \
+    "$ROOT/.agent/rules/rules.md" \
+    '\.antigravity/rules\.md' \
+    "legacy rules redirect to canonical antigravity rules" \
+    "legacy rules missing canonical redirect"
+  check_contains_literal \
+    "$ROOT/.agent/rules/rules.md" \
+    'legacy compatibility' \
+    "legacy rules include compatibility marker" \
+    "legacy rules missing compatibility marker"
+  check_contains_literal \
+    "$ROOT/.antigravity/rules.md" \
+    'docker system prune -a' \
+    "antigravity rules include docker system prune guard" \
+    "antigravity rules missing docker system prune guard"
+  check_contains_literal \
+    "$ROOT/.antigravity/rules.md" \
+    'chown -R' \
+    "antigravity rules include chown -R guard" \
+    "antigravity rules missing chown -R guard"
+  check_contains_literal \
+    "$ROOT/.antigravity/rules.md" \
+    'rollback' \
+    "antigravity rules include rollback reminder" \
+    "antigravity rules missing rollback reminder"
+fi
+
+# ADR-004: bootstrap MUST ship the override-layer load step. Structural
+# enforcement only — the framework ships the instruction; per-agent compliance
+# ("did this agent actually read the override") is honor-system like the
+# Sentinel and is NOT falsely claimed as test-enforced.
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'Load Override Layer' \
+  "bootstrap ships override-layer load step (ADR-004 §1a)" \
+  "bootstrap missing override-layer load step (ADR-004 §1a)"
+
+# ADR-007: bootstrap MUST ship the downstream-capabilities load step (§1b).
+# Structural only — per-agent compliance is honor-system (like the override read).
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'Load Downstream Capabilities' \
+  "bootstrap ships downstream-capabilities load step (ADR-007 §1b)" \
+  "bootstrap missing downstream-capabilities load step (ADR-007 §1b)"
+
+# ADR-009: bootstrap MUST ship the kb-consult scope-detected row (§3.6 / §1b knowledge_sources).
+# Structural only -- per-agent consult quality is honor-system (like the override read).
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'kb-consult' \
+  "bootstrap ships KB-consult scope-detected row (ADR-009)" \
+  "bootstrap missing KB-consult scope-detected row (ADR-009)"
+
+# ADR-007: a present downstream-capabilities.yaml MUST be schema gate-safe
+# (gate-relaxation is REJECTED, never clamped). Absent file -> validator exits 0.
+CAP_VALIDATOR="$ROOT/.agentcortex/tools/validate_downstream_capabilities.py"
+CAP_FILE="$ROOT/.agentcortex/context/private/downstream-capabilities.yaml"
+if [[ -f "$CAP_VALIDATOR" ]]; then
+  # python-present + gate-unsafe file -> FAIL (CI always has python). No-python host ->
+  # WARN (advisory): the runtime guarantee there is bootstrap §1b agent-discipline, honest
+  # per the framework no-python doctrine. (MissingPythonLevel is WARN, not a fake FAIL.)
+  run_python_check "downstream-capabilities gate-safety" WARN "$CAP_VALIDATOR" "$CAP_FILE"
+else
+  record_result SKIP "downstream-capabilities gate-safety -- validator not deployed (safe to ignore)"
+fi
+
+# ADR-008: the committed safety nucleus MUST match the AGENTS.md fenced span (CR-normalized).
+SAFETY_NUCLEUS_GEN="$ROOT/.agentcortex/tools/generate_safety_nucleus.py"
+if [[ -f "$SAFETY_NUCLEUS_GEN" ]]; then
+  run_python_check "safety nucleus freshness" WARN "$SAFETY_NUCLEUS_GEN" --check
+else
+  record_result SKIP "safety nucleus freshness -- generator not deployed (safe to ignore)"
+fi
+
+# ADR-006: advisory SSoT section-cap check (Ship History + Spec Index growth) as
+# a Python tool behind run_python_check (new checks = tools, not native lines, so
+# the native ratchet does not move). WARN-tier / never-FAIL: the tool ALWAYS exits
+# 0 and prints any over-cap finding, so an over-cap SSoT surfaces as advisory output
+# rather than a validator failure; the fix is the rotation procedure the tool names
+# (ship.md §State Update). No-python host -> WARN (advisory); tool absent -> SKIP
+# (run_python_check handles both). Caps live in .agent/config.yaml §document_lifecycle.
+run_python_check "ssot section caps (ship history + spec index)" WARN "$ROOT/.agentcortex/tools/check_ssot_caps.py" --root "$ROOT"
+
+# ADR-006: advisory decision-disposition check (archived Work Log `## Decisions`
+# entries missing a ship-time marker) as a Python tool behind run_python_check.
+# WARN-tier / never-FAIL (tool ALWAYS exits 0); silent no-op until a fork sets
+# document_lifecycle.decision_disposition_since. No-python -> WARN; tool absent -> SKIP.
+run_python_check "decision disposition (archived work logs)" WARN "$ROOT/.agentcortex/tools/check_decision_disposition.py" --root "$ROOT"
+
+# ADR-006: advisory Work Log `## External References` existence check (Spec/ADR
+# referents must exist on disk; PR/Issue referents are format-checked only, no
+# network call) as a Python tool behind run_python_check. WARN-tier / never-FAIL
+# (tool ALWAYS exits 0); silent no-op when no active Work Log exists. Backlog #161
+# (docs/reviews/2026-08-08-govern-audit-task-simulation.md F7): a log citing a
+# nonexistent spec path or PR previously passed both validators untouched.
+# No-python -> WARN; tool absent -> SKIP.
+run_python_check_source_only "source-only tool, not deployed by design (safe to ignore downstream)" \
+  "worklog external references (spec/ADR existence, advisory)" WARN "$ROOT/.agentcortex/tools/check_worklog_references.py" --root "$ROOT"
+
+ACTIVE_CODEX_RULES="$ROOT/codex/rules/default.rules"
+[[ -f "$ACTIVE_CODEX_RULES" ]] || ACTIVE_CODEX_RULES="$CODEX_RULES"
+if [[ -f "$ACTIVE_CODEX_RULES" ]]; then
+  check_contains_literal \
+    "$ACTIVE_CODEX_RULES" \
+    'prefix_rule(' \
+    "codex rules include prefix_rule()" \
+    "codex rules missing prefix_rule()"
+  check_contains_literal \
+    "$ACTIVE_CODEX_RULES" \
+    'docker system prune -a' \
+    "codex rules include docker system prune guard" \
+    "codex rules missing docker system prune guard"
+  check_contains_literal \
+    "$ACTIVE_CODEX_RULES" \
+    'chown -R' \
+    "codex rules include chown -R guard" \
+    "codex rules missing chown -R guard"
+else
+  record_result FAIL "codex rules file missing: $ACTIVE_CODEX_RULES"
+fi
+
+check_contains_literal \
+  "$ROOT_DEPLOY_SH" \
+  '.agentcortex/bin/deploy.sh' \
+  "deploy_brain.sh references canonical deploy script" \
+  "deploy_brain.sh missing canonical deploy reference"
+check_contains_literal \
+  "$ROOT_DEPLOY_PS1" \
+  "'.agentcortex', 'bin', 'deploy.sh'" \
+  "deploy_brain.ps1 references canonical deploy script" \
+  "deploy_brain.ps1 missing canonical deploy reference"
+check_contains_literal \
+  "$ROOT_DEPLOY_CMD" \
+  'deploy_brain.ps1' \
+  "deploy_brain.cmd delegates to sibling wrapper" \
+  "deploy_brain.cmd missing sibling-wrapper delegation"
+
+worklog_contract_files=(
+  "$ROOT/AGENTS.md"
+  "$ROOT/.agent/rules/engineering_guardrails.md"
+  "$ROOT/.agent/rules/security_guardrails.md"
+  "$ROOT/.agent/rules/state_machine.md"
+  "$ROOT/.agent/workflows/bootstrap.md"
+  "$ROOT/.agent/workflows/plan.md"
+  "$ROOT/.agent/workflows/handoff.md"
+  "$ROOT/.agent/workflows/ship.md"
+  "$PLATFORM_DOC"
+  "$ROOT/.agentcortex/docs/NONLINEAR_SCENARIOS.md"
+  "$ROOT/.agentcortex/docs/guides/antigravity-v5-runtime.md"
+)
+worklog_contract_errors=0
+for f in "${worklog_contract_files[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    printf '  worklog contract file not found: %s\n' "$f"
+    worklog_contract_errors=$((worklog_contract_errors + 1))
+    continue
+  fi
+  if ! grep -F -q -- '<worklog-key>' "$f"; then
+    printf '  worklog contract missing normalized key reference: %s\n' "$f"
+    worklog_contract_errors=$((worklog_contract_errors + 1))
+  fi
+  if grep -F -q -- 'docs/context/work/<branch-name>.md' "$f"; then
+    printf '  stale branch-name worklog path contract: %s\n' "$f"
+    worklog_contract_errors=$((worklog_contract_errors + 1))
+  fi
+  if grep -F -q -- 'docs/context/work/<branch>.md' "$f"; then
+    printf '  stale raw branch worklog path contract: %s\n' "$f"
+    worklog_contract_errors=$((worklog_contract_errors + 1))
+  fi
+done
+if [[ "$worklog_contract_errors" -gt 0 ]]; then
+  record_result FAIL "work log contract references are stale"
+else
+  record_result PASS "work log contract references use normalized keys"
+fi
+
+archive_contract_files=(
+  "$ROOT/.agent/workflows/handoff.md"
+  "$ROOT/.agentcortex/docs/guides/token-governance.md"
+  "$ROOT/.agentcortex/docs/guides/portable-minimal-kit.md"
+)
+archive_contract_errors=0
+for f in "${archive_contract_files[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    printf '  archive contract file not found: %s\n' "$f"
+    archive_contract_errors=$((archive_contract_errors + 1))
+    continue
+  fi
+  if ! grep -F -q -- '<worklog-key>-<YYYYMMDD>' "$f"; then
+    printf '  archive contract missing normalized key reference: %s\n' "$f"
+    archive_contract_errors=$((archive_contract_errors + 1))
+  fi
+  if grep -F -q -- 'docs/context/archive/work/<branch>-<YYYYMMDD>.md' "$f"; then
+    printf '  stale archive branch worklog path contract: %s\n' "$f"
+    archive_contract_errors=$((archive_contract_errors + 1))
+  fi
+done
+if [[ "$archive_contract_errors" -gt 0 ]]; then
+  record_result FAIL "archive contract references are stale"
+else
+  record_result PASS "archive contract references use normalized keys"
+fi
+
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'Recommended Skills' \
+  "bootstrap includes Recommended Skills contract" \
+  "bootstrap missing Recommended Skills contract"
+phase_skill_files=(
+  "$WORKFLOWS_DIR/plan.md"
+  "$WORKFLOWS_DIR/implement.md"
+  "$WORKFLOWS_DIR/review.md"
+  "$WORKFLOWS_DIR/test.md"
+  "$WORKFLOWS_DIR/handoff.md"
+  "$WORKFLOWS_DIR/ship.md"
+)
+phase_skill_errors=0
+for f in "${phase_skill_files[@]}"; do
+  if [[ ! -f "$f" ]]; then
+    printf '  phase skill file not found: %s\n' "$f"
+    phase_skill_errors=$((phase_skill_errors + 1))
+    continue
+  fi
+  if ! grep -F -q -- 'Recommended Skills' "$f"; then
+    printf '  missing Recommended Skills phase hook: %s\n' "$f"
+    phase_skill_errors=$((phase_skill_errors + 1))
+  fi
+done
+if [[ "$phase_skill_errors" -gt 0 ]]; then
+  record_result FAIL "phase workflows missing Recommended Skills hooks"
+else
+  record_result PASS "phase workflows include Recommended Skills hooks"
+fi
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  '## Ship Checklist' \
+  "ship workflow includes mandatory ship checklist" \
+  "ship workflow missing mandatory ship checklist"
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  'Active Work Log archived to `.agentcortex/context/archive/`' \
+  "ship workflow checklist includes archive step" \
+  "ship workflow checklist missing archive step"
+
+# Phase verification contract: gated workflows must reference bootstrap §2a
+phase_verify_files=(
+  "$WORKFLOWS_DIR/plan.md"
+  "$WORKFLOWS_DIR/implement.md"
+  "$WORKFLOWS_DIR/review.md"
+  "$WORKFLOWS_DIR/test.md"
+  "$WORKFLOWS_DIR/handoff.md"
+  "$WORKFLOWS_DIR/ship.md"
+)
+phase_verify_errors=0
+for f in "${phase_verify_files[@]}"; do
+  if ! grep -q -i 'Phase Verification' "$f" 2>/dev/null; then
+    printf '  missing Phase Verification section: %s\n' "$(basename "$f")"
+    phase_verify_errors=$((phase_verify_errors + 1))
+  fi
+done
+if [[ "$phase_verify_errors" -gt 0 ]]; then
+  record_result FAIL "phase workflows missing Phase Verification sections"
+else
+  record_result PASS "phase workflows include Phase Verification sections"
+fi
+
+# Gate evidence contract: bootstrap template must include Gate Evidence section
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  '## Gate Evidence' \
+  "bootstrap template includes Gate Evidence section" \
+  "bootstrap template missing Gate Evidence section"
+check_contains_literal \
+  "$WORKFLOWS_DIR/app-init.md" \
+  'merge-safe retrofit guidance' \
+  "app-init includes merge-safe docs retrofit guidance" \
+  "app-init missing merge-safe docs retrofit guidance"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'Partial adoption advisory' \
+  "bootstrap includes bounded partial adoption advisory" \
+  "bootstrap missing bounded partial adoption advisory"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'status: living' \
+  "bootstrap requires status: living before L1 authority reads" \
+  "bootstrap missing L1 status: living gate"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'BOTH `status: living` and `domain:`' \
+  "bootstrap requires full L1 contract before authority reads" \
+  "bootstrap missing full L1 contract gate"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'External authority rule' \
+  "bootstrap forces external specs through spec-intake" \
+  "bootstrap missing external authority routing rule"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'background context' \
+  "bootstrap treats substantial background material as spec-intake input" \
+  "bootstrap missing substantial-background intake rule"
+check_contains_literal \
+  "$WORKFLOWS_DIR/bootstrap.md" \
+  'Primary Domain Snapshot' \
+  "bootstrap records primary_domain snapshot" \
+  "bootstrap missing primary_domain snapshot contract"
+check_contains_literal \
+  "$WORKFLOWS_DIR/spec-intake.md" \
+  'Domain Doc L1 conflict check' \
+  "spec-intake includes L1 conflict check for external specs" \
+  "spec-intake missing L1 conflict check for external specs"
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  'structured `routing_actions` blocks' \
+  "ship workflow scopes routing_actions to structured blocks" \
+  "ship workflow missing structured routing_actions wording"
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  'Generic skip text is invalid' \
+  "ship workflow hardens primary_domain skip justification" \
+  "ship workflow missing primary_domain skip-hardening wording"
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  'Primary Domain Snapshot' \
+  "ship workflow cross-checks bootstrap primary_domain snapshot" \
+  "ship workflow missing primary_domain snapshot cross-check"
+check_contains_literal \
+  "$WORKFLOWS_DIR/ship.md" \
+  'Acceptable examples:' \
+  "ship workflow gives acceptable skip examples" \
+  "ship workflow missing acceptable skip examples"
+if [[ -f "$ROOT/.agentcortex/templates/docs-readme.md" ]]; then
+  check_contains_literal \
+    "$ROOT/.agentcortex/templates/docs-readme.md" \
+    '## Retrofit Note' \
+    "docs README template includes retrofit note" \
+    "docs README template missing retrofit note"
+else
+  record_result SKIP "docs README template retrofit note -- template not deployed"
+fi
+
+document_governance_spec_errors=0
+document_governance_partial_warn=0
+domain_doc_frontmatter_warn=0
+shopt -s nullglob
+for spec in "$ROOT"/docs/specs/*.md; do
+  [[ -f "$spec" ]] || continue
+  if grep -Eq '^primary_domain:[[:space:]]*[^[:space:]]+' "$spec"; then
+    if ! grep -F -q '## Domain Decisions' "$spec"; then
+      printf '  spec with primary_domain missing Domain Decisions: %s\n' "$spec"
+      document_governance_spec_errors=$((document_governance_spec_errors + 1))
+    fi
+    if [[ ! -d "$ROOT/docs/architecture" ]]; then
+      printf '  partial document-governance adoption: %s declares primary_domain but docs/architecture/ is missing\n' "$spec"
+      document_governance_partial_warn=$((document_governance_partial_warn + 1))
+    fi
+  fi
+done
+if [[ "$document_governance_spec_errors" -gt 0 ]]; then
+  record_result FAIL "document-governance spec contract violations detected"
+else
+  record_result PASS "document-governance specs preserve primary_domain and Domain Decisions contract"
+fi
+if [[ "$document_governance_partial_warn" -gt 0 ]]; then
+  record_result WARN "partial document-governance adoption advisories detected: ${document_governance_partial_warn}"
+fi
+
+if [[ -d "$ROOT/docs/architecture" ]]; then
+  for domain_doc in "$ROOT"/docs/architecture/*.md; do
+    [[ -f "$domain_doc" ]] || continue
+    [[ "$domain_doc" == *.log.md ]] && continue
+    # [[:space:]]*$ absorbs the CR of a doc committed with CRLF (docs/ has no line-ending rule, #215).
+    if ! grep -Eq '^status:[[:space:]]*living[[:space:]]*$' "$domain_doc" || ! grep -Eq '^domain:[[:space:]]*[^[:space:]]+' "$domain_doc"; then
+      printf '  domain doc candidate missing full L1 contract (status: living + domain:): %s\n' "$domain_doc"
+      domain_doc_frontmatter_warn=$((domain_doc_frontmatter_warn + 1))
+    fi
+  done
+fi
+if [[ "$domain_doc_frontmatter_warn" -gt 0 ]]; then
+  record_result WARN "legacy domain doc candidates were skipped as L1 authority (missing full L1 contract: status: living + domain:): ${domain_doc_frontmatter_warn}. Do not add frontmatter directly; use /govern-docs when promoting them."
+else
+  record_result PASS "domain doc candidates declare the full L1 contract when present"
+fi
+
+# routing_actions structural contract (governance self-audit F3). Structural
+# parsing lives in a Python tool (ADR-006, check_routing_actions.py) so
+# inline-map / fields-outside-block bypasses are rejected. The native block in
+# the else branch is the no-python degraded backstop (backlog #113): weaker
+# (whole-file substring + standalone-anchor based) but keeps reduced-assurance
+# coverage + the stale-pending WARN when Python is unavailable.
+if [[ -n "${PYTHON_BIN:-}" ]] && [[ -f "$ROUTING_ACTIONS_CHECK" ]]; then
+  run_python_check "routing_actions contract (structural)" FAIL "$ROUTING_ACTIONS_CHECK" --root "$ROOT"
+else
+routing_action_errors=0
+routing_action_warnings=0
+routing_action_stale_warnings=0
+routing_actions_pending_warn_days=14
+if [[ -f "$AGENT_CONFIG_YAML" ]]; then
+  parsed_routing_actions_days="$(
+    awk '
+      /^document_lifecycle:[[:space:]]*$/ { in_section=1; next }
+      in_section && /^[^[:space:]]/ { in_section=0 }
+      in_section && /^[[:space:]]+routing_actions_pending_warn_days:[[:space:]]*[0-9]+[[:space:]]*$/ {
+        sub(/^[^:]*:[[:space:]]*/, "", $0); print $0; exit
+      }
+    ' "$AGENT_CONFIG_YAML" 2>/dev/null || true
+  )"
+  if [[ "$parsed_routing_actions_days" =~ ^[0-9]+$ ]]; then
+    routing_actions_pending_warn_days="$parsed_routing_actions_days"
+  fi
+fi
+routing_actions_today_epoch="$(date -u +%s 2>/dev/null || true)"
+for review in "$ROOT"/docs/reviews/*.md; do
+  [[ -f "$review" ]] || continue
+  if grep -F -q 'routing_actions:' "$review"; then
+    for required in 'finding:' 'target_doc:' 'status:' 'owner:'; do
+      if ! grep -F -q "$required" "$review"; then
+        printf '  review snapshot missing routing_actions field %s: %s\n' "$required" "$review"
+        routing_action_errors=$((routing_action_errors + 1))
+      fi
+    done
+    while IFS= read -r target; do
+      [[ -z "$target" ]] && continue
+      if [[ ! "$target" =~ ^docs/(architecture|specs)/.+\.md$ ]]; then
+        printf '  routing_actions target_doc must point to docs/architecture/*.md or docs/specs/*.md: %s (%s)\n' "$review" "$target"
+        routing_action_errors=$((routing_action_errors + 1))
+      elif [[ ! -f "$ROOT/$target" ]]; then
+        printf '  routing_actions target_doc does not exist yet: %s (%s)\n' "$review" "$target"
+        routing_action_warnings=$((routing_action_warnings + 1))
+      fi
+    done < <(tr -d '\r' < "$review" | sed -n 's/^[[:space:]]*target_doc:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')
+    while IFS= read -r status; do
+      [[ -z "$status" ]] && continue
+      case "$status" in
+        pending|merged|rejected) ;;
+        *)
+          printf '  routing_actions status must be pending, merged, or rejected: %s (%s)\n' "$review" "$status"
+          routing_action_errors=$((routing_action_errors + 1))
+        ;;
+      esac
+    done < <(sed -n 's/^[[:space:]]*status:[[:space:]]*\([a-z]*\).*$/\1/p' "$review")
+    if [[ -n "$routing_actions_today_epoch" ]] && grep -Eq '^[[:space:]]*status:[[:space:]]*pending[[:space:]]*$' "$review"; then
+      review_base="$(basename "$review")"
+      if [[ "$review_base" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+        review_date="${BASH_REMATCH[1]}"
+        review_epoch="$(date -u -d "$review_date" +%s 2>/dev/null || date -j -f '%Y-%m-%d' "$review_date" +%s 2>/dev/null || true)"
+        if [[ "$review_epoch" =~ ^[0-9]+$ ]]; then
+          age_days=$(( (routing_actions_today_epoch - review_epoch) / 86400 ))
+          if [[ "$age_days" -ge "$routing_actions_pending_warn_days" ]]; then
+            printf '  stale pending routing_actions: %s (%sd old, threshold %sd)\n' "$review" "$age_days" "$routing_actions_pending_warn_days"
+            routing_action_stale_warnings=$((routing_action_stale_warnings + 1))
+          fi
+        fi
+      fi
+    fi
+  fi
+done
+if [[ "$routing_action_errors" -gt 0 ]]; then
+  record_result FAIL "routing_actions contract violations detected"
+else
+  record_result PASS "routing_actions contract is structurally valid when present"
+fi
+if [[ "$routing_action_warnings" -gt 0 ]]; then
+  record_result WARN "routing_actions target docs need follow-up: ${routing_action_warnings}"
+fi
+if [[ "$routing_action_stale_warnings" -gt 0 ]]; then
+  record_result WARN "stale pending routing_actions need canonical-doc follow-up: ${routing_action_stale_warnings}"
+fi
+fi
+shopt -u nullglob
+
+check_contains_literal \
+  "$CANONICAL_DEPLOY_SH" \
+  'LEGACY_IGNORE_START="# AI Brain OS - Agent System & Local Context"' \
+  "deploy script supports legacy ignore marker migration" \
+  "deploy script missing legacy ignore marker support"
+check_contains_literal \
+  "$CANONICAL_DEPLOY_SH" \
+  'strip_managed_ignore_blocks() {' \
+  "deploy script includes managed ignore block replacement helper" \
+  "deploy script missing managed ignore replacement helper"
+check_contains_literal \
+  "$CANONICAL_DEPLOY_SH" \
+  '.agentcortex/bin/' \
+  "deploy script targets canonical .agentcortex/bin namespace" \
+  "deploy script missing canonical namespace deployment path"
+
+DEPLOY_IGNORE_BLOCK="$(awk '
+/^# Agentic OS Template - Downstream Ignore Defaults$/ { capture = 1 }
+capture { print }
+/^# End Agentic OS Template - Downstream Ignore Defaults$/ {
+  if (capture) {
+    exit
+  }
+}
+' "$CANONICAL_DEPLOY_SH")"
+
+if [[ -z "$DEPLOY_IGNORE_BLOCK" ]]; then
+  record_result FAIL "deploy ignore block missing from deploy script"
+else
+  missing_patterns=0
+  for pattern in \
+    '# Agentic OS Template - Downstream Ignore Defaults' \
+    '.agentcortex/context/work/*.md' \
+    '.agentcortex/context/private/' \
+    '.agentcortex/context/.guard_receipt.json' \
+    '.agentcortex/context/.guard_receipts/' \
+    '.agentcortex/context/.guard_locks/' \
+    '.agent/private/' \
+    '.agentcortex-src/' \
+    '*.acx-incoming' \
+    '.openrouter/' \
+    '.claude-chat/' \
+    '.antigravity/scratch/' \
+    '# End Agentic OS Template - Downstream Ignore Defaults'; do
+    if ! printf '%s\n' "$DEPLOY_IGNORE_BLOCK" | grep -x -F -q -- "$pattern"; then
+      printf '  deploy ignore block missing required pattern: %s\n' "$pattern"
+      missing_patterns=$((missing_patterns + 1))
+    fi
+  done
+  if ! printf '%s\n' "$DEPLOY_IGNORE_BLOCK" | grep -F -q '.agentcortex/context/work/.gitkeep.md'; then
+    printf '  deploy ignore block missing .gitkeep.md negation pattern\n'
+    missing_patterns=$((missing_patterns + 1))
+  fi
+  for forbidden_downstream_pattern in \
+    '.agentcortex/context/current_state.md' \
+    '.agentcortex/context/archive/' \
+    'deploy_brain.sh' \
+    'deploy_brain.ps1' \
+    'deploy_brain.cmd' \
+    '.agentcortex-manifest'; do
+    if printf '%s\n' "$DEPLOY_IGNORE_BLOCK" | grep -x -F -q -- "$forbidden_downstream_pattern"; then
+      printf '  deploy ignore block must not include tracked file: %s\n' "$forbidden_downstream_pattern"
+      missing_patterns=$((missing_patterns + 1))
+    fi
+  done
+  if [[ "$missing_patterns" -gt 0 ]]; then
+    record_result FAIL "deploy ignore block contents are invalid"
+  else
+    record_result PASS "deploy ignore block contents are valid"
+  fi
+fi
+
+if [[ "$IS_SOURCE_REPO" -eq 1 ]]; then
+  if [[ -f "$ROOT/docs/README_zh-TW.md" ]]; then
+    check_contains_literal \
+      "$ROOT/docs/README_zh-TW.md" \
+      '用工作流程、交付閘門與工程護欄' \
+      "README_zh-TW.md encoding looks healthy" \
+      "README_zh-TW.md appears mojibaked or re-encoded"
+  fi
+  if [[ -f "$ROOT/README.md" ]]; then
+    check_contains_literal \
+      "$ROOT/README.md" \
+      'governance-first layer for AI coding agents' \
+      "README.md encoding looks healthy" \
+      "README.md appears mojibaked or re-encoded"
+  fi
+fi
+if [[ -f "$ROOT/.agentcortex/docs/TESTING_PROTOCOL_zh-TW.md" ]]; then
+  check_contains_literal \
+    "$ROOT/.agentcortex/docs/TESTING_PROTOCOL_zh-TW.md" \
+    '測試教戰守則' \
+    "TESTING_PROTOCOL_zh-TW.md encoding looks healthy" \
+    "TESTING_PROTOCOL_zh-TW.md appears mojibaked or re-encoded"
+fi
+if [[ -f "$ROOT/.agentcortex/docs/guides/audit-guardrails.md" ]]; then
+  check_contains_literal \
+    "$ROOT/.agentcortex/docs/guides/audit-guardrails.md" \
+    'Test 1: Invisible Assistant Check (.gitignore Automation)' \
+    "audit-guardrails.md encoding looks healthy" \
+    "audit-guardrails.md appears mojibaked or re-encoded"
+fi
+if [[ -f "$ROOT/.agentcortex/docs/guides/audit-guardrails_zh-TW.md" ]]; then
+  check_contains_literal \
+    "$ROOT/.agentcortex/docs/guides/audit-guardrails_zh-TW.md" \
+    '為什麼不寫成自動化 Shell Script？' \
+    "audit-guardrails_zh-TW.md encoding looks healthy" \
+    "audit-guardrails_zh-TW.md appears mojibaked or re-encoded"
+fi
+
+WORKLOG_MAX_LINES="${WORKLOG_MAX_LINES:-300}"
+WORKLOG_MAX_KB="${WORKLOG_MAX_KB:-12}"
+ACTIVE_WORKLOG_WARN_THRESHOLD="${ACTIVE_WORKLOG_WARN_THRESHOLD:-8}"
+ACTIVE_WORKLOG_FAIL_THRESHOLD="${ACTIVE_WORKLOG_FAIL_THRESHOLD:-12}"
+ARCHIVE_SIZE_WARN_KB="${ARCHIVE_SIZE_WARN_KB:-10240}"
+WORKLOG_GATE_EVIDENCE_LEGACY_CUTOFF="${WORKLOG_GATE_EVIDENCE_LEGACY_CUTOFF:-2026-03-25}"
+WORKLOG_DIR="$ROOT/.agentcortex/context/work"
+# AC-6: resolve current-branch worklog key once (slash→dash normalization).
+# Detached HEAD, no git, or git unavailable → cur_key="" (safe degrade: all logs treated as historical).
+cur_key=""
+if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  # Use symbolic-ref --short first: works on empty repos (no commits yet).
+  # Fall back to rev-parse --abbrev-ref for detached-HEAD scenarios where symbolic-ref fails.
+  _cur_branch="$(git -C "$ROOT" symbolic-ref --short HEAD 2>/dev/null)" \
+    || _cur_branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" || true
+  if [[ -n "$_cur_branch" && "$_cur_branch" != "HEAD" ]]; then
+    # F10 (2026-07-11 receipt-integrity audit): apply the canonical Work Log
+    # key normalization (bootstrap.md:123-131) in full — (1) chars outside
+    # [a-zA-Z0-9._-] -> '-', (2) collapse '-' runs, (3) strip leading/trailing
+    # '-'/'.', (4) lowercase, (5) truncate to 100 chars. Previously this only
+    # replaced '/' with '-' and stayed case-sensitive, so an uppercase or
+    # punctuated branch (e.g. "Feat/X", "release/v1.2:rc") mismatched the
+    # canonical lowercase Work Log filename and was misdetected as historical,
+    # downgrading current-branch-only Resume/Test-Gate escalations FAIL->WARN.
+    cur_key="$(printf '%s' "$_cur_branch" \
+      | sed -E 's/[^a-zA-Z0-9._-]/-/g; s/-+/-/g; s/^[-.]+//; s/[-.]+$//' \
+      | tr '[:upper:]' '[:lower:]' \
+      | cut -c1-100)"
+  fi
+fi
+if [[ -d "$WORKLOG_DIR" ]]; then
+  worklog_warnings=0
+  worklog_count=0
+  for wl in "$WORKLOG_DIR"/*.md; do
+    [[ -f "$wl" ]] || continue
+    worklog_count=$((worklog_count + 1))
+    wl_lines="$(wc -l < "$wl" 2>/dev/null)" || true
+    wl_bytes="$(wc -c < "$wl" 2>/dev/null)" || true
+    wl_kb=$(( ${wl_bytes:-0} / 1024 ))
+    if [[ "$wl_lines" -gt "$WORKLOG_MAX_LINES" ]] || [[ "$wl_kb" -gt "$WORKLOG_MAX_KB" ]]; then
+      printf '  work log needs compaction: %s (%s lines, %sKB)\n' "$(basename "$wl")" "$wl_lines" "$wl_kb"
+      worklog_warnings=$((worklog_warnings + 1))
+    fi
+  done
+  if [[ "$worklog_warnings" -gt 0 ]]; then
+    record_result FAIL "work log compaction warnings detected"
+  else
+    record_result PASS "active work log sizes are within compaction thresholds"
+  fi
+  if [[ "$worklog_count" -gt "$ACTIVE_WORKLOG_FAIL_THRESHOLD" ]]; then
+    record_result WARN "active work log count over hygiene hard-limit (${worklog_count} > ${ACTIVE_WORKLOG_FAIL_THRESHOLD}); archive completed branches via /handoff or rm — advisory only (work logs are gitignored, CI-invisible)"
+  elif [[ "$worklog_count" -gt "$ACTIVE_WORKLOG_WARN_THRESHOLD" ]]; then
+    record_result WARN "active work log count exceeds hygiene threshold (${worklog_count} > ${ACTIVE_WORKLOG_WARN_THRESHOLD}; hard limit ${ACTIVE_WORKLOG_FAIL_THRESHOLD})"
+  else
+    record_result PASS "active work log count is within hygiene threshold"
+  fi
+  # Archive directory size — surface unbounded growth before it becomes an
+  # ingestion-time hazard. WARN-only; opt-out via ARCHIVE_SIZE_WARN_KB=0.
+  ARCHIVE_DIR="$ROOT/.agentcortex/context/archive"
+  if [[ -d "$ARCHIVE_DIR" ]] && [[ "$ARCHIVE_SIZE_WARN_KB" -gt 0 ]]; then
+    # Logical bytes, not disk-allocated. `du -sk` counts allocated blocks, so it read
+    # ~27% high (measured 2026-08-16: 2326KB vs 1835KB over 181 files) and disagreed with
+    # validate.ps1, which sums file lengths (#174). Logical size is the right measure:
+    # threshold is a proxy for ingestion cost, and block rounding is not even stable
+    # across filesystems for identical content. `du --apparent-size` is GNU-only and
+    # would break macOS/BSD adopters, so sum via ls (portable, one exec for the batch).
+    archive_kb="$(find "$ARCHIVE_DIR" -type f -exec ls -ln {} + 2>/dev/null | awk '{s+=$5} END {print int(s/1024)}')" || true
+    if [[ -n "$archive_kb" ]] && [[ "$archive_kb" -gt "$ARCHIVE_SIZE_WARN_KB" ]]; then
+      record_result WARN "archive size ${archive_kb}KB exceeds threshold ${ARCHIVE_SIZE_WARN_KB}KB; consider /retro-driven cold-tier rotation"
+    else
+      record_result PASS "archive size within threshold (${archive_kb:-0}KB / ${ARCHIVE_SIZE_WARN_KB}KB)"
+    fi
+  fi
+  # Work Log integrity marker check — detect truncated writes from interrupted sessions
+  worklog_truncated=0
+  for wl in "$WORKLOG_DIR"/*.md; do
+    [[ -f "$wl" ]] || continue
+    wl_content="$(cat "$wl" 2>/dev/null)"
+    # A well-formed work log must have at least a Branch header and one ## section.
+    # Accept list form ("- Branch:" or "- **Branch**:") AND table form
+    # ("| Branch | ... |") — the canonical template at .agentcortex/templates/worklog.md
+    # uses a table for readability; earlier versions only matched list form.
+    if ! <<< "$wl_content" grep -Eq '(^- (\*\*Branch\*\*|Branch):|^\| (\*\*Branch\*\*|Branch) +\|)' || \
+       ! <<< "$wl_content" grep -q '^## '; then
+      printf '  possibly truncated work log: %s\n' "$(basename "$wl")"
+      worklog_truncated=$((worklog_truncated + 1))
+    fi
+  done
+  if [[ "$worklog_truncated" -gt 0 ]]; then
+    record_result WARN "possibly truncated work logs detected: ${worklog_truncated}"
+  else
+    record_result PASS "active work logs pass structural integrity check"
+  fi
+
+  # Work Log evidence chain check (per AGENTS.md Work Log Contract)
+  phase_field_missing=0
+  checkpoint_missing=0
+  checkpoint_violation_list=""
+  gate_evidence_missing=0
+  gate_evidence_missing_list=""
+  legacy_gate_evidence_missing=0
+  gate_progression_illegal=0
+  gate_progression_skipped=0
+  phase_summary_missing=0
+  sentinel_marker_missing=0
+  test_gate_results_missing=0
+  security_findings_missing=0
+  guardrails_receipt_missing=0
+  current_phase_incoherent=0
+  shipped_not_archived=0
+  evidence_placeholder_only=0
+  review_pass_with_unproven=0
+  reclassify_header_not_reset=0
+  handoff_resume_incomplete=0
+  hotfix_ship_no_evidence=0
+  adr_coverage_undocumented=0
+  # AC-6: current-branch gate invariant FAIL counter.
+  # Covers Resume block absent/incomplete + Test Gate Results missing at handoff/ship.
+  # ONE new native record_result FAIL site handles both (baseline +1).
+  current_branch_gate_fail=0
+  current_branch_gate_fail_list=""
+  # F8 (2026-07-11 receipt-integrity audit): shared value-shape + resolvability
+  # check for header SHA-like fields (Checkpoint SHA / Diff Base SHA). Previously
+  # presence-only: a heading with a non-SHA value (e.g. "not-a-sha") passed
+  # silently. Accepts a hex object id (7-40 chars, optionally followed by
+  # trailing note text) or an observed legitimate placeholder — "none",
+  # "pending-commit" (both seen in real archived logs), or the unfilled
+  # template default "<git-sha or none>" (templates/worklog.md; two real active
+  # logs still carry it) — anything else is a WARN-tier violation. Current-
+  # branch logs additionally get a `git rev-parse --verify` resolvability
+  # check; historical logs are shape-checked only (squash/rebase legitimately
+  # invalidates old SHAs). Mutates the pre-existing checkpoint_missing /
+  # checkpoint_violation_list counters (ADR-006 native-extension path — see
+  # Work Log Drift Log — not a new record_result call site).
+  _acx_check_sha_field() {
+    local content="$1" field="$2" is_cur="$3" wl_label="$4"
+    local raw val lc verify_val
+    raw="$(printf '%s' "$content" | grep -m1 -iE "(^-[[:space:]]*\`?${field}\`?:|^\|[[:space:]]*\`?${field}\`?[[:space:]]*\|)")" || true
+    [[ -z "$raw" ]] && return 0
+    if [[ "$raw" == -* ]]; then
+      val="$(printf '%s' "$raw" | sed -E "s/^-[[:space:]]*\`?${field}\`?:[[:space:]]*//")"
+    else
+      val="$(printf '%s' "$raw" | awk -F'|' '{print $3}')"
+    fi
+    val="$(printf '%s' "$val" | sed -E 's/<!--.*-->//' | tr -d '`\r' | xargs)" || true
+    [[ -z "$val" ]] && return 0  # unparseable — presence is already covered separately; degrade silently
+    lc="$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lc" == "none" || "$lc" == "pending-commit" || "$lc" == "<git-sha or none>" ]]; then
+      return 0
+    fi
+    if [[ "$lc" =~ ^[0-9a-f]{7,40}$ ]]; then
+      verify_val="$val"
+    elif [[ "${lc%% *}" =~ ^[0-9a-f]{7,40}$ ]]; then
+      verify_val="${val%% *}"
+    else
+      checkpoint_missing=$((checkpoint_missing + 1))
+      checkpoint_violation_list="${checkpoint_violation_list}  invalid ${field} value ('${val}') in ${wl_label}\n"
+      return 0
+    fi
+    if [[ "$is_cur" -eq 1 ]] && ! git -C "$ROOT" rev-parse --verify "${verify_val}^{commit}" >/dev/null 2>&1; then
+      checkpoint_missing=$((checkpoint_missing + 1))
+      checkpoint_violation_list="${checkpoint_violation_list}  unresolvable ${field} ('${verify_val}') in ${wl_label} (git rev-parse --verify failed)\n"
+    fi
+    return 0
+  }
+  for wl in "$WORKLOG_DIR"/*.md; do
+    [[ -f "$wl" ]] || continue
+    wl_content="$(cat "$wl" 2>/dev/null)"
+    # AC-6: determine whether this Work Log is the current-branch log.
+    # Match <cur_key>.md OR <owner>-<cur_key>.md (owner prefix pattern).
+    is_current_branch=0
+    if [[ -n "$cur_key" ]]; then
+      # F10: lowercase the basename too (cur_key is already lowercase) so the
+      # comparison is case-insensitive on both sides — defense against a
+      # non-conforming log filename that wasn't written in canonical case.
+      wl_basename="$(basename "$wl" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$wl_basename" == "${cur_key}.md" ]] || [[ "$wl_basename" == *"-${cur_key}.md" ]]; then
+        is_current_branch=1
+      fi
+    fi
+    # Accept list (bold-optional, backtick-optional) OR table form — the template
+    # emits `- Created Date: `<date>`` (plain/backtick, no bold) and real logs use
+    # list or table form; a bold-only parser left this empty for every real log,
+    # silently disabling the legacy exemption (and its D5 refinement). Extract the
+    # YYYY-MM-DD regardless of surrounding markup.
+    created_date="$(<<< "$wl_content" sed -n -E 's/^-[[:space:]]*\*{0,2}Created Date\*{0,2}:[[:space:]]*`?([0-9]{4}-[0-9]{2}-[0-9]{2}).*/\1/p; s/^\|[[:space:]]*\*{0,2}Created Date\*{0,2}[[:space:]]*\|[[:space:]]*`?([0-9]{4}-[0-9]{2}-[0-9]{2}).*/\1/p' | head -n 1 | tr -d '\r')"
+    legacy_gate_evidence=0
+    if [[ -n "$created_date" ]] && [[ "$created_date" < "$WORKLOG_GATE_EVIDENCE_LEGACY_CUTOFF" ]]; then
+      legacy_gate_evidence=1
+    fi
+    # Header field: Current Phase — accept list OR table form (see template/worklog.md)
+    if ! <<< "$wl_content" grep -qE '(^- (`Current Phase`|Current Phase):|^\| (`Current Phase`|Current Phase) +\|)'; then
+      phase_field_missing=$((phase_field_missing + 1))
+    fi
+    # Header field: Checkpoint SHA — accept list OR table form
+    if ! <<< "$wl_content" grep -qE '(^- (`Checkpoint SHA`|Checkpoint SHA):|^\| (`Checkpoint SHA`|Checkpoint SHA) +\|)'; then
+      checkpoint_missing=$((checkpoint_missing + 1))
+    else
+      # F8: value-shape + (current-branch-only) resolvability validation.
+      _acx_check_sha_field "$wl_content" "Checkpoint SHA" "$is_current_branch" "$(basename "$wl")"
+    fi
+    # F8: Diff Base SHA gets the same value treatment when present. No pre-
+    # existing presence check for this field — presence is NOT newly required
+    # here, only value-shape/resolvability when the field IS present.
+    _acx_check_sha_field "$wl_content" "Diff Base SHA" "$is_current_branch" "$(basename "$wl")"
+    # Runtime section: ## Gate Evidence — check existence, receipt format,
+    # AND phase progression legality. Illegal progression = FAIL.
+    if ! <<< "$wl_content" grep -q '^## Gate Evidence'; then
+      if [[ "$legacy_gate_evidence" -eq 1 ]] && [[ "$is_current_branch" -eq 0 ]]; then
+        legacy_gate_evidence_missing=$((legacy_gate_evidence_missing + 1))
+      else
+        # D5: a log on the CURRENT branch claiming legacy status (Created Date
+        # < cutoff) but missing gate evidence cannot legitimately be a
+        # pre-Runtime-v4 log — you are actively shipping on this branch now.
+        # Deny the legacy WARN downgrade and treat as a FAIL-tier miss.
+        gate_evidence_missing=$((gate_evidence_missing + 1))
+        gate_evidence_missing_list="${gate_evidence_missing_list}  $(basename "$wl"): no ## Gate Evidence section\n"
+      fi
+    elif ! <<< "$wl_content" grep -qiE '^(`?- )?gate:.*verdict:'; then
+      if [[ "$legacy_gate_evidence" -eq 1 ]] && [[ "$is_current_branch" -eq 0 ]]; then
+        legacy_gate_evidence_missing=$((legacy_gate_evidence_missing + 1))
+      else
+        # D5: a log on the CURRENT branch claiming legacy status (Created Date
+        # < cutoff) but missing gate evidence cannot legitimately be a
+        # pre-Runtime-v4 log — you are actively shipping on this branch now.
+        # Deny the legacy WARN downgrade and treat as a FAIL-tier miss.
+        gate_evidence_missing=$((gate_evidence_missing + 1))
+        gate_evidence_missing_list="${gate_evidence_missing_list}  $(basename "$wl"): ## Gate Evidence has no receipt line\n"
+      fi
+    else
+      # Parse gate receipts and verify phase progression. Use PYTHON_BIN
+      # (set in the preamble) so the SKIP path is consistent with
+      # run_python_check — silent skips here previously produced PASS by
+      # accident when Python was unavailable.
+      if [[ -n "$PYTHON_BIN" ]]; then
+        # Python source passed via single-quoted heredoc → variable so that
+        # shell-special characters in the code (", `, $, ->) are NOT interpreted
+        # by bash. Previously this was an inline -c "..." double-quoted string;
+        # the embedded `"` and `->` leaked to the shell (created a stray file and
+        # corrupted the -c argument), silently disabling this entire check.
+        _acx_gate_py=$(cat <<'PYEOF'
+import sys, re
+# quick-win / unknown: implement can go directly to ship (fast path)
+LEGAL_DEFAULT = {
+    'bootstrap': ['plan'],
+    'plan':      ['implement'],
+    'implement': ['review','test','ship'],
+    'review':    ['implement','test','ship'],
+    'test':      ['ship','implement'],
+    'handoff':   ['ship','retro'],
+    'ship':      [],
+}
+# feature / architecture-change: must go through review+test+handoff; no shortcuts
+LEGAL_STRICT = {
+    'bootstrap': ['plan'],
+    'plan':      ['implement'],
+    'implement': ['review','test'],
+    'review':    ['implement','test'],
+    'test':      ['handoff','implement'],
+    # 'implement' = HANDEDOFF->IMPLEMENTING reverse edge (state_machine.md §Allowed
+    # Transitions: "ship Entry Condition fail; code change required"); the loop must
+    # then re-run review->test->handoff, still enforced by the M10 stale-review check.
+    'handoff':   ['ship','retro','implement'],
+    'ship':      [],
+}
+# hotfix: must review+test but handoff is optional (goes test->ship directly)
+# plan is always required per engineering_guardrails.md §10.2 — no implement shortcut
+LEGAL_HOTFIX = {
+    'bootstrap': ['plan'],
+    'plan':      ['implement'],
+    'implement': ['review','test'],
+    'review':    ['implement','test'],
+    'test':      ['ship','implement'],
+    'ship':      [],
+}
+content = sys.stdin.read()
+lines = content.splitlines()
+wl_class = ''
+for l in lines:
+    m = re.match(r'^-\s+(?:\*\*)?[Cc]lassification(?:\*\*)?\s*:\s+\`?([a-zA-Z][\w-]*)', l)
+    if not m:
+        # table form: | Classification | `feature` |
+        m = re.match(r'^\|\s*(?:\*\*)?[Cc]lassification(?:\*\*)?\s*\|\s*\`?([a-zA-Z][\w-]*)', l)
+    if m:
+        wl_class = m.group(1).lower()
+        break
+if wl_class in ('feature', 'architecture-change'):
+    LEGAL = LEGAL_STRICT
+elif wl_class == 'hotfix':
+    LEGAL = LEGAL_HOTFIX
+elif wl_class in ('quick-win', 'tiny-fix'):
+    LEGAL = LEGAL_DEFAULT
+else:
+    # H1: fail-closed for unknown/misspelled classification — use strictest transitions
+    # (mirrors the completeness check which also treats unknown as feature-level)
+    LEGAL = LEGAL_STRICT
+# H4: count STRUCTURED reclassification records in Drift Log (count-based, not position-based)
+# Requires format: Reclassif* <sep> ... <arrow> — rejects prose mentions like "considered but rejected"
+# e.g. "Reclassification: quick-win -> feature" matches; "reclassification considered" does not
+# Count-based: allows one reset per record; normal drift entries after reclassif do NOT invalidate it
+in_drift = False
+reclassify_count = 0
+for l in lines:
+    if re.match(r'^## Drift Log', l):
+        in_drift = True
+        continue
+    elif in_drift and re.match(r'^## ', l):
+        break
+    elif in_drift:
+        _rm = re.search(r'\bReclassif\w*\s*[:\-]\s*([\w-]+)\s*->\s*([\w-]+)', l)
+        if _rm and _rm.group(1).lower() != _rm.group(2).lower():
+            reclassify_count += 1
+# T48: section-scope gate parsing to ## Gate Evidence section only
+# T154: only the FIRST ## Gate Evidence section is authoritative
+# T175/T178/T241: fenced code blocks (backtick/tilde, 0-3 space indent per CommonMark)
+# T181/T242: HTML comment blocks (order-aware finditer left-to-right)
+# T243: fail-closed — if heading exists but suppressed, emit error
+# T244: run fence/comment tracking on EVERY line (was: only outside section)
+#   Prevents fenced content inside ## Gate Evidence from being collected as real receipts
+#   and prevents fence-parity leakage across the section boundary (opener inside → closer outside)
+# T247: track masked receipt-format lines inside the section during the main loop
+#   (replaces post-loop raw-rescan which had false-positives and false-negatives)
+RECEIPT_RE = re.compile(r'^(?:\x60?- )?gate:\s*\w+\s*\|', re.IGNORECASE)
+# Inside fences, lines may be indented; allow leading whitespace for masked-receipt detection
+MASKED_RECEIPT_RE = re.compile(r'^\s*(?:\x60?- )?gate:\s*\w+\s*\|', re.IGNORECASE)
+in_gate_evidence_section = False
+gate_evidence_seen = False
+gate_lines = []
+masked_receipt_in_section = False  # T247: receipt-format line was present but masked
+in_code_fence = False
+in_html_comment = False
+for l in lines:
+    was_in_fence = in_code_fence
+    if re.match(r'^ {0,3}(\x60{3,}|~{3,})', l):
+        in_code_fence = not in_code_fence
+    was_in_comment = in_html_comment
+    for _m in re.finditer(r'<!--|-->', l):
+        in_html_comment = (_m.group() == '<!--')
+    # masked: line is/was inside a fence or comment (fence marker lines are also masked)
+    masked = (was_in_fence or in_code_fence) or (was_in_comment or in_html_comment)
+    if re.match(r'^## Gate Evidence', l) and not gate_evidence_seen and not in_code_fence and not in_html_comment:
+        in_gate_evidence_section = True
+        gate_evidence_seen = True
+        continue
+    if in_gate_evidence_section and re.match(r'^## ', l) and not masked:
+        in_gate_evidence_section = False
+        continue
+    if in_gate_evidence_section:
+        if masked:
+            if MASKED_RECEIPT_RE.match(l):
+                masked_receipt_in_section = True  # T247: real receipt hidden in fence/comment
+        else:
+            gate_lines.append(l)
+# T243: fail-closed if heading exists but was suppressed (fence/comment blocked recognition)
+if not gate_evidence_seen:
+    if any(re.match(r'^## Gate Evidence', l) for l in lines):
+        print('incomplete:gate-evidence-suppressed (unclosed fence or HTML comment above ## Gate Evidence -- validate manually)')
+        sys.exit(0)
+# T245: fail-closed if fence/comment was left unclosed INSIDE Gate Evidence
+# (receipts inside the unclosed block are silently masked — signal rather than returning ok)
+if in_code_fence or in_html_comment:
+    print('incomplete:unterminated-fence-or-comment (unclosed code fence or HTML comment in ## Gate Evidence -- validate manually)')
+    sys.exit(0)
+# T247: no unmasked receipt collected but at least one was masked — targeted error
+# Uses main-loop masking state (no separate rescan), so it correctly respects
+# the first-section guard, fence/comment state, and masked ## headings.
+unmasked_receipt = any(RECEIPT_RE.match(l) for l in gate_lines)
+if gate_evidence_seen and not unmasked_receipt and masked_receipt_in_section:
+    print('incomplete:receipts-in-fence (Gate Evidence has receipt-format lines but all are inside code fences or HTML comments -- move receipts out of code blocks)')
+    sys.exit(0)
+gates = []
+has_ship_receipt = False  # H3: track ANY ship receipt regardless of verdict
+review_not_ready = False  # track pending re-review requirement after NOT READY reverse edge
+had_not_ready = False  # sticky: a review NOT READY reverse edge occurred (for remediation hint)
+nr_index = 0  # gates recorded after the latest review NOT READY start here
+resets_used = 0  # H4: track consumed reclassification records
+for l in gate_lines:
+    m = re.match(r'^(?:\x60?- )?gate:\s*(\w+)\s*\|', l, re.IGNORECASE)
+    if m:
+        phase = m.group(1).lower()
+        # H3: record ship presence BEFORE the verdict filter
+        if phase == 'ship':
+            has_ship_receipt = True
+        # supporting workflows are out-of-band; exclude to avoid false illegal-transition flags
+        if phase in ('retro', 'research', 'brainstorm', 'decide', 'audit', 'govern-audit'):
+            continue
+        # Only count PASS verdicts; NOT READY / FAIL are reverse edges, not forward progress
+        v = re.search(r'\|[^|]*verdict:\s*([A-Za-z _]+?)(\s*\||$)', l, re.IGNORECASE)
+        if v and v.group(1).strip().upper() != 'PASS':
+            # NOT READY / FAIL review is a reverse edge — discard the preceding
+            # implement to avoid a false-positive implement→implement pair after
+            # re-implementation (test.md §Step 5 reverse-edge; review.md §NOT READY)
+            if phase == 'review':
+                if gates and gates[-1] == 'implement':
+                    gates.pop()
+                # The latest review verdict wins, also after a review PASS. Recorded gates
+                # are never deleted (that would hide an illegal edge logged before this
+                # point); the re-review requirement covers the gates recorded after it.
+                review_not_ready = True  # flag: re-review required before test/ship
+                had_not_ready = True  # remember for the re-review remediation hint below
+                nr_index = len(gates)
+            continue
+        # PASS verdict: if review PASS, clear the pending re-review flag
+        if phase == 'review':
+            review_not_ready = False
+        # H4: Reclassification reset — one reset per structured drift record; count-based
+        if phase == 'bootstrap' and gates and reclassify_count > resets_used:
+            gates = []
+            nr_index = 0
+            resets_used += 1
+        gates.append(phase)
+# Completeness check first — valid even with 1 gate (avoids early-return bypass)
+gate_set = set(gates)
+# H3: completeness triggers on ANY ship receipt, not just PASS ones
+if has_ship_receipt or 'ship' in gate_set:
+    if wl_class in ('feature', 'architecture-change'):
+        required = {'bootstrap','plan','implement','review','test','handoff'}
+    elif wl_class == 'hotfix':
+        required = {'bootstrap','plan','implement','review','test'}
+    elif wl_class == 'quick-win':
+        # H1: quick-win has real required phases — not an empty set
+        required = {'bootstrap','plan','implement'}
+    elif wl_class == 'tiny-fix':
+        # tiny-fix is exempt from gate ceremony (AGENTS.md §tiny-fix fast path)
+        required = set()
+    else:
+        # H1: fail-closed for unknown/misspelled classification — treat as feature
+        required = {'bootstrap','plan','implement','review','test','handoff'}
+    missing_phases = required - gate_set
+    if missing_phases:
+        print(f'incomplete:{",".join(sorted(missing_phases))} (classification:{wl_class or "unknown"})')
+        sys.exit(0)
+# NOT READY reverse-edge check: if review_not_ready is still set (no subsequent review
+# PASS cleared it), any test/handoff/ship in gates = re-review was skipped
+if review_not_ready and any(g in ('test','handoff','ship') for g in gates[nr_index:]):
+    bad_next = next(g for g in gates[nr_index:] if g in ('test','handoff','ship'))
+    print(f'illegal:NOT_READY-review->{bad_next} (re-review skipped after NOT READY — implement→review required per review.md)')
+    sys.exit(0)
+# Progression check requires 2+ gates; tiny-fix has no required phase sequence
+if len(gates) < 2 or wl_class == 'tiny-fix':
+    print('ok')
+    sys.exit(0)
+for i in range(1, len(gates)):
+    prev, curr = gates[i-1], gates[i]
+    allowed = LEGAL.get(prev, [])
+    if curr not in allowed:
+        if curr == 'review' and had_not_ready:
+            # A NOT-READY re-review reached PASS with no fresh implement PASS in
+            # between (the reverse edge popped the prior implement, so plan->review
+            # is now the illegal edge). Still a FAIL — but name the exact remedy
+            # instead of the bare illegal-edge text.
+            print(f'illegal:{prev}->review (NOT READY re-review: add a fresh "Gate: implement | Verdict: PASS" receipt for the fix BEFORE the re-review PASS -- review.md §Reverse Transition)')
+        else:
+            print(f'illegal:{prev}->{curr} (classification:{wl_class or "unknown"})')
+        sys.exit(0)
+# M10: stale-review check — if most recent implement follows most recent review,
+# then test/handoff/ship without a new review = stale review violation
+# (test.md §Step 5 reverse edge: implement-after-review MUST re-review before test)
+# quick-win and tiny-fix treat review as optional — re-review is NOT required.
+# Unknown/H1 fail-closed classifications follow feature rules, so M10 applies.
+if wl_class not in ('quick-win', 'tiny-fix'):
+    last_review_idx = max((i for i, g in enumerate(gates) if g == 'review'), default=-1)
+    last_impl_idx   = max((i for i, g in enumerate(gates) if g == 'implement'), default=-1)
+    if last_review_idx >= 0 and last_impl_idx > last_review_idx:
+        post_impl = gates[last_impl_idx + 1:]
+        if any(g in ('test', 'handoff', 'ship') for g in post_impl):
+            bad_next = next(g for g in post_impl if g in ('test', 'handoff', 'ship'))
+            print(f'illegal:implement-after-review->{bad_next} (stale review: implement occurred after last review PASS; re-review required)')
+            sys.exit(0)
+print('ok')
+PYEOF
+)
+        gate_check="$("$PYTHON_BIN" -c "$_acx_gate_py" <<< "$wl_content" 2>/dev/null)"
+        if [[ "$gate_check" == illegal:* ]]; then
+          printf '  illegal gate progression in %s: %s\n' "$(basename "$wl")" "${gate_check#illegal:}"
+          gate_progression_illegal=$((gate_progression_illegal + 1))
+        elif [[ "$gate_check" == incomplete:* ]]; then
+          printf '  incomplete gate receipts in %s: missing %s\n' "$(basename "$wl")" "${gate_check#incomplete:}"
+          gate_progression_illegal=$((gate_progression_illegal + 1))
+        fi
+      else
+        gate_progression_skipped=1
+        # Bash-only fallback (M9): even without Python, catch ship receipts missing
+        # minimum prerequisite gates (plan + implement). Cannot verify legal ordering
+        # but can detect obvious bypasses. Increments gate_progression_illegal so FAIL
+        # is recorded — a shipped log without plan/implement is always a violation.
+        if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*ship[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS'; then
+          has_plan=$(<<< "$wl_content" grep -ciE 'Gate:[[:space:]]*plan[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS') || true
+          has_impl=$(<<< "$wl_content" grep -ciE 'Gate:[[:space:]]*implement[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS') || true
+          if [[ "$has_plan" -eq 0 ]] || [[ "$has_impl" -eq 0 ]]; then
+            printf '  [bash-fallback] shipped without plan/implement gate in %s\n' "$(basename "$wl")"
+            gate_progression_illegal=$((gate_progression_illegal + 1))
+          fi
+        fi
+      fi
+    fi
+    # Runtime section: ## Phase Summary
+    if ! <<< "$wl_content" grep -q '^## Phase Summary'; then
+      phase_summary_missing=$((phase_summary_missing + 1))
+    fi
+    # Sentinel marker discoverability — Work Log Phase Summary SHOULD contain
+    # ⚡ ACX at least once so the AGENTS.md Sentinel Check has a persistent
+    # audit trail (chat output is ephemeral). WARN-only — does not break ship.
+    # Accept either the emoji form "⚡ ACX" or the plain "ACX" tag for
+    # terminals that strip non-ASCII.
+    if <<< "$wl_content" grep -q '^## Phase Summary' \
+       && ! <<< "$wl_content" grep -qE '(⚡[[:space:]]?ACX|[[:space:]]ACX([[:space:]]|$))'; then
+      sentinel_marker_missing=$((sentinel_marker_missing + 1))
+    fi
+    # Test Gate Results — engineering_guardrails.md §12.2 requires evidence be recorded
+    # under "Test Gate Results" for feature/architecture-change work logs that have
+    # reached the implement or later phase. WARN-only for historical logs.
+    # AC-6: FAIL for current-branch log when at handoff/ship phase without Test Gate Results.
+    # Parse classification from list form ("- Classification:") or table form ("| Classification |")
+    if [[ -n "$PYTHON_BIN" ]]; then
+      # Python via single-quoted heredoc -> variable (verbatim; no bash metachar parsing)
+      # (#336) sys.stdin.read() drains the pipe fully BEFORE the early `break`.
+      # Iterating `sys.stdin` line-by-line and breaking on the first match leaves
+      # printf with unwritten bytes on a >64 KB Work Log; printf then takes
+      # SIGPIPE (141), pipefail promotes it, and errexit aborts validate.sh
+      # mid-run with no Summary line. Draining first makes the break byte-safe.
+      _acx_wlclass_py=$(cat <<'PYEOF'
+import re,sys
+for l in sys.stdin.read().splitlines():
+    m=re.match(r'^-\s+\*{0,2}[Cc]lassification\*{0,2}\s*:\s*\x60?([a-zA-Z][\w-]*)',l)
+    if not m: m=re.match(r'^\|\s*\*{0,2}[Cc]lassification\*{0,2}\s*\|\s*\x60?([a-zA-Z][\w-]*)',l)
+    if m: print(m.group(1).lower()); break
+PYEOF
+)
+      wl_class="$(<<< "$wl_content" "$PYTHON_BIN" -c "$_acx_wlclass_py" 2>/dev/null)"
+    else
+      # Python unavailable: list-form-only fallback.
+      # (#336) Capture ALL matches then take the first line in bash. Piping sed
+      # into `head -n 1` closes the pipe after one line, so sed/printf take
+      # SIGPIPE (141) on a >64 KB log and pipefail aborts the run before the
+      # Summary prints. sed here reads to EOF, so nothing closes the pipe early.
+      _wl_class_all="$(<<< "$wl_content" sed -n 's/^- \(**\)\?Classification\1\?:[[:space:]]*//p' | tr -d '\r\`')"
+      wl_class="${_wl_class_all%%$'\n'*}"
+    fi
+    if [[ "$wl_class" == "feature" || "$wl_class" == "architecture-change" ]]; then
+      if <<< "$wl_content" grep -qi 'Gate: implement'; then
+        if ! <<< "$wl_content" grep -qiE '^#+[[:space:]]+Test Gate Results'; then
+          # AC-6: current-branch at handoff/ship → FAIL; otherwise WARN.
+          # Use gate-receipt presence only here (wl_phase_for_resume is set later in this iteration).
+          wl_at_handoff_ship=0
+          if [[ "$is_current_branch" -eq 1 ]]; then
+            if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*(handoff|ship)[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS'; then
+              wl_at_handoff_ship=1
+            fi
+          fi
+          if [[ "$wl_at_handoff_ship" -eq 1 ]]; then
+            current_branch_gate_fail=$((current_branch_gate_fail + 1))
+            current_branch_gate_fail_list="${current_branch_gate_fail_list}  $(basename "$wl"): Test Gate Results section missing (required for architecture-change/feature at handoff/ship)\n"
+          else
+            test_gate_results_missing=$((test_gate_results_missing + 1))
+          fi
+        fi
+      fi
+    fi
+    # (#288) Security Findings audit — security_guardrails.md §Work Log requires
+    # findings be recorded under a `## Security Findings` heading. The security
+    # scan is auto-enforced during implement/review/ship, so audit feature-tier
+    # logs (feature/architecture-change/hotfix) that carry a review or ship
+    # receipt. WARN-tier: artifact presence, not proof the scan ran.
+    if [[ "$wl_class" == "feature" || "$wl_class" == "architecture-change" || "$wl_class" == "hotfix" ]]; then
+      if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*(review|ship)[[:space:]]*\|'; then
+        if ! <<< "$wl_content" grep -qE '^## Security Findings'; then
+          security_findings_missing=$((security_findings_missing + 1))
+        fi
+      fi
+    fi
+    # (#288) Loaded-Sections receipt audit — engineering_guardrails.md requires
+    # bootstrap (Full Mode) echo a `Guardrails loaded:` receipt in ## Session Info.
+    # Scope to the CURRENT-branch log only: historical/archived logs predate the
+    # convention and would flood WARNs (mirrors the AC-6 is_current_branch gate).
+    # Full-Mode tiers ONLY (feature/architecture-change/hotfix): quick-win runs
+    # Quick Mode and tiny-fix runs Lite — neither loads Full-Mode guardrails, so
+    # the receipt rule does not apply to them. WARN-tier: presence, not proof.
+    if [[ "$is_current_branch" -eq 1 && ( "$wl_class" == "feature" || "$wl_class" == "architecture-change" || "$wl_class" == "hotfix" ) ]]; then
+      if ! <<< "$wl_content" grep -qiE 'Guardrails loaded:'; then
+        guardrails_receipt_missing=$((guardrails_receipt_missing + 1))
+      fi
+    fi
+    # MEDIUM-1 (review PASS with UNPROVEN rows): check for review PASS receipt alongside
+    # unresolved UNPROVEN table rows — review.md §Burden of Proof requires NOT READY in this case.
+    # Direct approach: flag if review PASS co-exists with any UNPROVEN row not tagged [NEEDS_HUMAN].
+    # (The prior ! grep -qvE condition was always false because header/gate lines don't match
+    # the UNPROVEN pattern, causing grep -qvE to succeed and the check to be permanently skipped.)
+    if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*review[[:space:]]*\|.*Verdict:[[:space:]]*PASS'; then
+      unproven_untagged="$(<<< "$wl_content" grep '✗ UNPROVEN' | grep -v '\[NEEDS_HUMAN\]' | head -1)" || true
+      if [[ -n "$unproven_untagged" ]]; then
+        review_pass_with_unproven=$((review_pass_with_unproven + 1))
+      fi
+    fi
+    # MEDIUM-3 (M5): evidence non-empty check for shipped feature/arch-change/quick-win logs.
+    # The bootstrap placeholder "Pending: bootstrap only" is not real evidence.
+    if [[ "$wl_class" == "feature" || "$wl_class" == "architecture-change" || "$wl_class" == "quick-win" ]]; then
+      if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*ship[[:space:]]*\|.*Verdict:[[:space:]]*PASS'; then
+        evidence_body="$(<<< "$wl_content" sed -n '/^## Evidence/,/^## /p' | tail -n +2 | grep -v '^## ' | grep -v '^$' | head -5)" || true
+        if [[ -z "$evidence_body" || "$evidence_body" == *"Pending: bootstrap only"* ]]; then
+          evidence_placeholder_only=$((evidence_placeholder_only + 1))
+        fi
+      fi
+    fi
+    # Current Phase consistency (HIGH-2): if a ship PASS receipt exists,
+    # Current Phase should be 'ship'. Divergence means the header was not updated.
+    if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*ship[[:space:]]*\|.*Verdict:[[:space:]]*PASS'; then
+      cp_val="$(<<< "$wl_content" grep -m1 -iE '^-[[:space:]]*\*?\*?Current Phase\*?\*?:' \
+        | sed 's/.*Current Phase[^:]*:[[:space:]]*//' | tr -d '`\r' | tr '[:upper:]' '[:lower:]' | xargs)" || true
+      if [[ -n "$cp_val" && "$cp_val" != "ship" ]]; then
+        current_phase_incoherent=$((current_phase_incoherent + 1))
+      fi
+      # Archival check (Item 1): if Current Phase is 'ship' and ship PASS receipt exists,
+      # this Work Log should have been archived. Presence in work/ means /ship step 3 was skipped.
+      if [[ -z "$cp_val" || "$cp_val" == "ship" ]]; then
+        shipped_not_archived=$((shipped_not_archived + 1))
+      fi
+    fi
+    # Finding 9 (HIGH): Reclassification state inconsistency — Drift Log records
+    # "Reclassification:" but Classification header was never reset to CLASSIFIED,
+    # leaving downstream agents with a stale classification tier.
+    if <<< "$wl_content" grep -q '## Drift Log' \
+       && <<< "$wl_content" grep -qiE '^[[:space:]]*-[[:space:]]+Reclassif'; then
+      cls_hdr="$(<<< "$wl_content" grep -m1 -iE '^-[[:space:]]*\*?\*?Classification\*?\*?:' \
+        | sed 's/.*Classification[^:]*:[[:space:]]*//' | tr -d '`\r' | tr '[:upper:]' '[:lower:]' | xargs)" || true
+      if [[ -n "$cls_hdr" && "$cls_hdr" != "classified" ]]; then
+        reclassify_header_not_reset=$((reclassify_header_not_reset + 1))
+      fi
+    fi
+    # Finding 5 (MEDIUM/HIGH): Handoff Resume Block completeness — prose rule (handoff.md §1a)
+    # requires all sub-sections only once feature/architecture-change work reaches
+    # handoff/ship. The Work Log template's pre-handoff `Resume: none` placeholder
+    # is valid and quick-win/hotfix paths are exempt from /handoff.
+    # AC-6: current-branch + resume_required + (absent ## Resume OR missing subsections) → FAIL.
+    #        historical or present-with-incomplete → WARN.
+    wl_phase_for_resume="$(<<< "$wl_content" grep -m1 -iE '^-[[:space:]]*\*?\*?Current Phase\*?\*?:' \
+      | sed 's/.*Current Phase[^:]*:[[:space:]]*//' | tr -d '`\r' | tr '[:upper:]' '[:lower:]' | xargs)" || true
+    resume_required=0
+    if [[ "$wl_class" == "feature" || "$wl_class" == "architecture-change" ]]; then
+      if [[ "$wl_phase_for_resume" == "handoff" || "$wl_phase_for_resume" == "ship" ]] \
+         || <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*(handoff|ship)[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS'; then
+        resume_required=1
+      fi
+    fi
+    if [[ "$resume_required" -eq 1 ]]; then
+      if ! <<< "$wl_content" grep -q '^## Resume'; then
+        # AC-6: absent ## Resume section when required
+        if [[ "$is_current_branch" -eq 1 ]]; then
+          current_branch_gate_fail=$((current_branch_gate_fail + 1))
+          current_branch_gate_fail_list="${current_branch_gate_fail_list}  $(basename "$wl"): ## Resume section absent (required for architecture-change/feature at handoff/ship)\n"
+        else
+          handoff_resume_incomplete=$((handoff_resume_incomplete + 1))
+        fi
+      else
+        resume_body="$(<<< "$wl_content" sed -n '/^## Resume/,/^## /p')"
+        missing_subsections=0
+        for subsec in "Read Map" "Skip List" "Context Snapshot"; do
+          if ! printf '%s' "$resume_body" | grep -qiE "^###[[:space:]]+${subsec}"; then
+            missing_subsections=$((missing_subsections + 1))
+          fi
+        done
+        if [[ "$missing_subsections" -gt 0 ]]; then
+          if [[ "$is_current_branch" -eq 1 ]]; then
+            current_branch_gate_fail=$((current_branch_gate_fail + 1))
+            current_branch_gate_fail_list="${current_branch_gate_fail_list}  $(basename "$wl"): ## Resume missing required sub-sections (Read Map, Skip List, Context Snapshot)\n"
+          else
+            handoff_resume_incomplete=$((handoff_resume_incomplete + 1))
+          fi
+        fi
+      fi
+    fi
+    # Finding 13 (MEDIUM): hotfix fast-path evidence check — hotfix is exempt from
+    # /handoff but MUST provide evidence. Warn when a hotfix reaches ship phase
+    # but ## Evidence section is missing or contains only the bootstrap placeholder.
+    if [[ "$wl_class" == "hotfix" ]]; then
+      if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*ship[[:space:]]*\|.*Verdict:[[:space:]]*PASS'; then
+        hotfix_evidence="$(<<< "$wl_content" sed -n '/^## Evidence/,/^## /p' | tail -n +2 | grep -v '^## ' | grep -v '^$' | head -5)" || true
+        if [[ -z "$hotfix_evidence" || "$hotfix_evidence" == *"Pending: bootstrap only"* ]]; then
+          hotfix_ship_no_evidence=$((hotfix_ship_no_evidence + 1))
+        fi
+      fi
+    fi
+    # Finding 14 (MEDIUM): ADR Coverage gap — for feature/architecture-change Work Logs,
+    # bootstrap should have run the ADR Coverage Check and recorded the result (yes/skip)
+    # in ## Drift Log. Missing record means the check was silently bypassed.
+    if [[ "$wl_class" == "feature" || "$wl_class" == "architecture-change" ]]; then
+      if <<< "$wl_content" grep -qi 'Gate: plan\|Gate: implement'; then
+        if ! <<< "$wl_content" grep -qiE 'ADR.*[Cc]overage|[Cc]overage.*ADR|adr.*check|no.*adr.*found'; then
+          adr_coverage_undocumented=$((adr_coverage_undocumented + 1))
+        fi
+      fi
+    fi
+  done
+  # Backlog #149: every check below is guarded by `worklog_count -gt 0`, so with
+  # no active work logs the whole family emitted NOTHING — not a SKIP, absent
+  # from the run — while the summary still printed "integrity check passed".
+  # A fresh clone or a downstream install has no logs (the directory ships only
+  # a dotfile placeholder, which the *.md glob does not match), so ~18 checks
+  # silently disappeared and the run-to-run result count became unusable as a
+  # regression signal. One family-level SKIP makes the absence visible.
+  if [[ "$worklog_count" -eq 0 ]]; then
+    record_result SKIP "active work-log checks -- no active work logs in .agentcortex/context/work/ (18 checks not applicable)"
+  fi
+  if [[ "$phase_field_missing" -gt 0 ]]; then
+    record_result WARN "work logs missing Current Phase field: ${phase_field_missing}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "all active work logs have Current Phase field"
+  fi
+  if [[ "$checkpoint_missing" -gt 0 ]]; then
+    # F8: message now covers the field being absent OR present-with-an-invalid-
+    # or-unresolvable value (previously presence-only for Checkpoint SHA; Diff
+    # Base SHA had no coverage at all).
+    record_result WARN "work logs with missing/invalid Checkpoint SHA field or invalid/unresolvable Diff Base SHA / Checkpoint SHA values: ${checkpoint_missing}"
+    printf '%b' "$checkpoint_violation_list"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "all active work logs have well-formed Checkpoint SHA / Diff Base SHA values"
+  fi
+  if [[ "$gate_evidence_missing" -gt 0 ]]; then
+    record_result FAIL "work logs missing gate evidence receipts: ${gate_evidence_missing}"
+    # #210: name the log and the expected line, not just a count.
+    printf '%b' "$gate_evidence_missing_list"
+    printf '  expected receipt line: - Gate: <phase> | Verdict: PASS | Classification: <tier> | Timestamp: <ISO>\n'
+  elif [[ "$worklog_count" -gt 0 ]] && [[ "$legacy_gate_evidence_missing" -eq 0 ]]; then
+    record_result PASS "all active work logs have gate evidence receipts"
+  fi
+  if [[ "$legacy_gate_evidence_missing" -gt 0 ]]; then
+    record_result WARN "legacy work logs missing gate evidence receipts: ${legacy_gate_evidence_missing} (created before ${WORKLOG_GATE_EVIDENCE_LEGACY_CUTOFF})"
+  fi
+  if [[ "$gate_progression_illegal" -gt 0 ]]; then
+    record_result FAIL "work logs with illegal gate phase progression: ${gate_progression_illegal}"
+  elif [[ "$gate_progression_skipped" -eq 1 ]]; then
+    if [[ "$ACX_NO_PYTHON" -eq 1 ]]; then
+      record_result SKIP "gate evidence phase progression -- python checks disabled (--no-python)"
+    else
+      record_result WARN "gate evidence phase progression -- python unavailable (install Python 3.9+ for full validation)"
+    fi
+  elif [[ "$worklog_count" -gt 0 ]] && [[ "$gate_evidence_missing" -eq 0 ]] && [[ "$legacy_gate_evidence_missing" -eq 0 ]]; then
+    record_result PASS "gate evidence phase progression is legal"
+  fi
+  if [[ "$phase_summary_missing" -gt 0 ]]; then
+    record_result WARN "work logs missing Phase Summary section: ${phase_summary_missing}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "all active work logs have Phase Summary section"
+  fi
+  if [[ "$sentinel_marker_missing" -gt 0 ]]; then
+    record_result WARN "work logs missing sentinel marker (⚡ ACX) in Phase Summary: ${sentinel_marker_missing}"
+  elif [[ "$worklog_count" -gt 0 ]] && [[ "$phase_summary_missing" -eq 0 ]]; then
+    record_result PASS "all active work logs carry sentinel marker for audit trail"
+  fi
+  if [[ "$test_gate_results_missing" -gt 0 ]]; then
+    record_result WARN "feature/architecture-change work logs missing Test Gate Results section (engineering_guardrails.md §12.2): ${test_gate_results_missing}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "test gate results evidence present in applicable work logs"
+  fi
+  # (#288) Security Findings section presence (security_guardrails.md §Work Log).
+  if [[ "$security_findings_missing" -gt 0 ]]; then
+    record_result WARN "feature-tier work logs at review/ship missing ## Security Findings section (security_guardrails.md §Work Log): ${security_findings_missing}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "security findings section present in applicable work logs"
+  fi
+  # (#288) Loaded-Sections receipt presence in current-branch log (engineering_guardrails.md bootstrap receipt).
+  if [[ "$guardrails_receipt_missing" -gt 0 ]]; then
+    record_result WARN "current-branch work log missing 'Guardrails loaded:' receipt in ## Session Info (engineering_guardrails.md bootstrap receipt): ${guardrails_receipt_missing}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "loaded-sections receipt present in current-branch work log"
+  fi
+  if [[ "$current_phase_incoherent" -gt 0 ]]; then
+    record_result WARN "work logs with ship PASS receipt but Current Phase != ship (header not updated): ${current_phase_incoherent}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "Current Phase field is consistent with last gate receipt in all work logs"
+  fi
+  if [[ "$shipped_not_archived" -gt 0 ]]; then
+    record_result WARN "shipped work logs still in active work/ directory (archival incomplete — /ship step 3 skipped?): ${shipped_not_archived}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "no shipped work logs found in active work/ directory"
+  fi
+  if [[ "$evidence_placeholder_only" -gt 0 ]]; then
+    record_result FAIL "feature/arch-change/quick-win shipped work logs with bootstrap-placeholder ## Evidence (NO EVIDENCE = NO SHIP per AGENTS.md §Delivery Gates): ${evidence_placeholder_only}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "shipped feature/arch-change/quick-win work logs have non-placeholder Evidence sections"
+  fi
+  if [[ "$review_pass_with_unproven" -gt 0 ]]; then
+    record_result WARN "work logs with review PASS receipt but unresolved UNPROVEN rows (receipt should be NOT READY per review.md §Burden of Proof): ${review_pass_with_unproven}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "no review PASS receipts with unresolved UNPROVEN rows detected"
+  fi
+  if [[ "$reclassify_header_not_reset" -gt 0 ]]; then
+    record_result WARN "work logs with Reclassification in Drift Log but Classification header not reset to CLASSIFIED (implement.md §Mid-Execution Guard step c incomplete): ${reclassify_header_not_reset}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "no reclassification header inconsistency detected"
+  fi
+  if [[ "$handoff_resume_incomplete" -gt 0 ]]; then
+    record_result WARN "work logs with ## Resume section missing required sub-sections (handoff.md §1a — Read Map, Skip List, Context Snapshot required): ${handoff_resume_incomplete}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "handoff Resume Blocks have required sub-sections where present"
+  fi
+  # AC-6: single FAIL record_result covering current-branch Resume + Test-Gate-Results invariants.
+  # Only fires when the current branch has a Work Log that is missing required evidence at handoff/ship.
+  # Historical logs and pre-handoff logs remain WARN (not counted here).
+  if [[ "$current_branch_gate_fail" -gt 0 ]]; then
+    record_result FAIL "current-branch work log missing required gate evidence at handoff/ship (AC-6 — Resume block and/or Test Gate Results absent): ${current_branch_gate_fail}"
+    printf '%b' "$current_branch_gate_fail_list"
+  fi
+  if [[ "$hotfix_ship_no_evidence" -gt 0 ]]; then
+    record_result WARN "hotfix work logs shipped without ## Evidence (hotfix fast-path still requires diff + behavior verification per handoff.md §Trigger Conditions): ${hotfix_ship_no_evidence}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "hotfix shipped work logs carry evidence where present"
+  fi
+  if [[ "$adr_coverage_undocumented" -gt 0 ]]; then
+    record_result WARN "feature/architecture-change work logs past plan phase with no ADR Coverage Check record in Drift Log (bootstrap.md §ADR Coverage Check result should be logged): ${adr_coverage_undocumented}"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "ADR Coverage Check records present in applicable work logs"
+  fi
+  # Gate receipt schema validation (§4.5 structural check) — every pipe-format gate
+  # receipt in ## Gate Evidence must include Verdict: and Classification: fields.
+  # WARN not FAIL: archived Work Logs may predate this check (a SEPARATE archive
+  # loop below covers Verdict/Classification presence only for archive/*.md and
+  # is untouched by F7/F9); active logs with partial receipts are a process gap,
+  # not a ship-blocking error.
+  # F7 (2026-07-11 receipt-integrity audit): also require a Timestamp: field with
+  # at least an ISO date. Order-of-appearance remains authoritative for gate
+  # progression (see templates/worklog.md ## Gate Evidence note) — Timestamp is
+  # provenance metadata only; no monotonic/chronological check is performed.
+  # F9: also compare each receipt's Classification value (case-insensitive)
+  # against the Work Log header Classification. Mismatch is WARN, not FAIL —
+  # reclassification epochs are legal (state machine rollback-to-CLASSIFIED) and
+  # epoch parsing is out of scope for this check.
+  gate_schema_violations=0
+  gate_schema_violation_list=""
+  for wl in "$WORKLOG_DIR"/*.md; do
+    [[ -f "$wl" ]] || continue
+    wl_name="$(basename "$wl")"
+    wl_content="$(cat "$wl" 2>/dev/null)"
+    # F9: header Classification value — same strict "starts with a letter"
+    # extraction the gate-progression parser already uses, so an unfilled/
+    # malformed header (still the literal template placeholder) yields empty
+    # and is skipped rather than compared (nothing meaningful to compare).
+    hdr_class="$(printf '%s' "$wl_content" \
+      | grep -m1 -iE '^-[[:space:]]*\*{0,2}Classification\*{0,2}[[:space:]]*:[[:space:]]*`?[a-zA-Z]' \
+      | sed -E 's/^-[[:space:]]*\*{0,2}Classification\*{0,2}[[:space:]]*:[[:space:]]*`?([a-zA-Z][a-zA-Z0-9_-]*).*/\1/')" || true
+    if [[ -z "$hdr_class" ]]; then
+      hdr_class="$(printf '%s' "$wl_content" \
+        | grep -m1 -iE '^\|[[:space:]]*\*{0,2}Classification\*{0,2}[[:space:]]*\|[[:space:]]*`?[a-zA-Z]' \
+        | sed -E 's/^\|[[:space:]]*\*{0,2}Classification\*{0,2}[[:space:]]*\|[[:space:]]*`?([a-zA-Z][a-zA-Z0-9_-]*).*/\1/')" || true
+    fi
+    hdr_class="$(printf '%s' "$hdr_class" | tr '[:upper:]' '[:lower:]')"
+    # Extract gate evidence section lines (pipe-format receipts starting with "- Gate:")
+    while IFS= read -r receipt_line; do
+      # Each receipt must contain Verdict: (case-insensitive) and Classification: (case-insensitive)
+      if ! printf '%s' "$receipt_line" | grep -qiE '[Vv]erdict[[:space:]]*:'; then
+        gate_schema_violations=$((gate_schema_violations + 1))
+        gate_schema_violation_list="${gate_schema_violation_list}  malformed gate receipt (missing Verdict:) in ${wl_name}\n"
+        break
+      fi
+      if ! printf '%s' "$receipt_line" | grep -qiE '[Cc]lassification[[:space:]]*:'; then
+        gate_schema_violations=$((gate_schema_violations + 1))
+        gate_schema_violation_list="${gate_schema_violation_list}  malformed gate receipt (missing Classification:) in ${wl_name}\n"
+        break
+      fi
+      # F7: Timestamp field must be present with a parseable ISO date (a full ISO
+      # datetime like 2026-07-10T12:20:00Z is also accepted — the date-only regex
+      # matches its leading YYYY-MM-DD).
+      if ! printf '%s' "$receipt_line" | grep -qiE 'Timestamp[[:space:]]*:[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}'; then
+        gate_schema_violations=$((gate_schema_violations + 1))
+        gate_schema_violation_list="${gate_schema_violation_list}  malformed gate receipt (missing/unparseable Timestamp:) in ${wl_name}: ${receipt_line}\n"
+        break
+      fi
+      # F9: receipt Classification must agree with the header Classification.
+      if [[ -n "$hdr_class" ]]; then
+        receipt_class="$(printf '%s' "$receipt_line" \
+          | sed -nE 's/.*[Cc]lassification[[:space:]]*:[[:space:]]*([a-zA-Z][a-zA-Z0-9_-]*).*/\1/p' \
+          | tr '[:upper:]' '[:lower:]')" || true
+        if [[ -n "$receipt_class" && "$receipt_class" != "$hdr_class" ]]; then
+          gate_schema_violations=$((gate_schema_violations + 1))
+          gate_schema_violation_list="${gate_schema_violation_list}  receipt Classification ('${receipt_class}') differs from header Classification ('${hdr_class}') in ${wl_name}: ${receipt_line}\n"
+          break
+        fi
+      fi
+    done < <(grep -iE '^\-[[:space:]]+[Gg]ate[[:space:]]*:' "$wl" 2>/dev/null || true)
+  done
+  if [[ "$gate_schema_violations" -gt 0 ]]; then
+    record_result WARN "active work log gate receipts with schema violations (missing Verdict/Classification/Timestamp, or Classification mismatched with header): ${gate_schema_violations}"
+    printf '%b' "$gate_schema_violation_list"
+  elif [[ "$worklog_count" -gt 0 ]]; then
+    record_result PASS "all active work log gate receipts have required fields and consistent Classification (gate/verdict/classification/timestamp)"
+  fi
+  # Advisory lock staleness check — reads JSON fields per config.yaml §worklog_lock.
+  # All JSON parsing and stale logic stays inside Python to avoid eval/injection.
+  stale_locks=0
+  lock_files_present=0
+  for lockf in "$WORKLOG_DIR"/*.lock.json; do
+    [[ -f "$lockf" ]] || continue
+    lock_files_present=1
+    if [[ -n "$PYTHON_BIN" ]]; then
+      # Python via single-quoted heredoc -> variable (verbatim; no bash metachar parsing)
+      _acx_stale_py=$(cat <<'PYEOF'
+import json, sys, datetime
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    ua = d.get('updated_at', '')
+    tm = int(d.get('stale_timeout_minutes', 60))
+    if not ua:
+        print('unreadable')
+        sys.exit(0)
+    dt = datetime.datetime.fromisoformat(ua)
+    now = datetime.datetime.now(dt.tzinfo or datetime.timezone.utc)
+    age_min = (now - dt).total_seconds() / 60
+    print('stale' if age_min > tm else 'fresh')
+except Exception:
+    print('unreadable')
+PYEOF
+)
+      stale_verdict="$("$PYTHON_BIN" -c "$_acx_stale_py" "$lockf" 2>/dev/null)"
+      case "$stale_verdict" in
+        stale)
+          printf '  stale advisory lock: %s\n' "$(basename "$lockf")"
+          stale_locks=$((stale_locks + 1))
+          ;;
+        unreadable)
+          printf '  unreadable advisory lock: %s\n' "$(basename "$lockf")"
+          stale_locks=$((stale_locks + 1))
+          ;;
+      esac
+    fi
+  done
+  if [[ "$stale_locks" -gt 0 ]]; then
+    record_result WARN "stale advisory work log locks detected: ${stale_locks}"
+  elif [[ "$lock_files_present" -eq 1 ]] && [[ -z "$PYTHON_BIN" ]]; then
+    if [[ "$ACX_NO_PYTHON" -eq 1 ]]; then
+      record_result SKIP "advisory lock staleness check -- python checks disabled (--no-python)"
+    else
+      record_result WARN "advisory lock staleness check -- python unavailable (install Python 3.9+ for full validation)"
+    fi
+  fi
+  # Work Log lock owner/phase mismatch checks — WARN only, never FAIL.
+  # Skips stale and unreadable locks (already covered above); skips orphan locks
+  # (no matching Work Log .md).  JSON parsing uses Python (same as stale check).
+  owner_phase_mismatches=0
+  if [[ -n "$PYTHON_BIN" ]]; then
+    _acx_lockfields_py=$(cat <<'PYEOF'
+import json, sys, datetime
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    ua = d.get('updated_at', '')
+    tm = int(d.get('stale_timeout_minutes', 60))
+    if not ua:
+        print('unreadable'); sys.exit(0)
+    dt = datetime.datetime.fromisoformat(ua)
+    now = datetime.datetime.now(dt.tzinfo or datetime.timezone.utc)
+    age_min = (now - dt).total_seconds() / 60
+    if age_min > tm:
+        print('stale'); sys.exit(0)
+    owner = d.get('owner', '')
+    phase = d.get('phase', '')
+    print('ok|' + owner + '|' + phase)
+except Exception:
+    print('unreadable')
+PYEOF
+)
+    for lockf in "$WORKLOG_DIR"/*.lock.json; do
+      [[ -f "$lockf" ]] || continue
+      _fields="$("$PYTHON_BIN" -c "$_acx_lockfields_py" "$lockf" 2>/dev/null)" || true
+      case "$_fields" in
+        stale|unreadable) continue ;;
+        ok\|*)
+          _lock_owner="$(printf '%s' "$_fields" | cut -d'|' -f2)"
+          _lock_phase="$(printf '%s' "$_fields" | cut -d'|' -f3)"
+          ;;
+        *) continue ;;
+      esac
+      # Derive Work Log path from lock filename: strip .lock.json -> .md
+      _lockbase="$(basename "$lockf" .lock.json)"
+      _wl="$WORKLOG_DIR/${_lockbase}.md"
+      [[ -f "$_wl" ]] || continue  # orphan lock — not this check's job
+      # Extract Owner: strip backticks and whitespace; handle list form and table form
+      _wl_owner="$(grep -m1 -iE '^\-[[:space:]]+Owner[[:space:]]*:|^\|[[:space:]]*Owner[[:space:]]*\|' "$_wl" 2>/dev/null \
+        | sed -E 's/.*Owner[[:space:]]*:[[:space:]]*//; s/.*\|[[:space:]]*Owner[[:space:]]*\|[[:space:]]*([^|]+)\|.*/\1/' \
+        | tr -d '`\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')" || true
+      # Extract Current Phase: same stripping
+      _wl_phase="$(grep -m1 -iE '^\-[[:space:]]+Current Phase[[:space:]]*:|^\|[[:space:]]*Current Phase[[:space:]]*\|' "$_wl" 2>/dev/null \
+        | sed -E 's/.*Current Phase[[:space:]]*:[[:space:]]*//; s/.*\|[[:space:]]*Current Phase[[:space:]]*\|[[:space:]]*([^|]+)\|.*/\1/' \
+        | tr -d '`\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')" || true
+      if [[ -n "$_wl_owner" && "$_lock_owner" != "$_wl_owner" ]]; then
+        printf '  worklog lock owner mismatch: %s owner=%s worklog Owner=%s\n' \
+          "$(basename "$lockf")" "$_lock_owner" "$_wl_owner"
+        owner_phase_mismatches=$((owner_phase_mismatches + 1))
+      fi
+      if [[ -n "$_wl_phase" && "$_lock_phase" != "$_wl_phase" ]]; then
+        printf '  worklog lock phase mismatch: %s phase=%s worklog Current Phase=%s\n' \
+          "$(basename "$lockf")" "$_lock_phase" "$_wl_phase"
+        owner_phase_mismatches=$((owner_phase_mismatches + 1))
+      fi
+    done
+  fi
+  if [[ "$owner_phase_mismatches" -gt 0 ]]; then
+    record_result WARN "work log lock owner/phase mismatches detected: ${owner_phase_mismatches}"
+  fi
+else
+  record_result SKIP "active work log directory not present"
+fi
+
+if [[ -f "$GUARD_CONTEXT_WRITE" ]]; then
+  record_result PASS "guarded write capability installed"
+else
+  record_result SKIP "guard capability not installed"
+fi
+
+GUARD_RECEIPT="$ROOT/.agentcortex/context/.guard_receipt.json"
+if [[ -f "$GUARD_RECEIPT" ]]; then
+  record_result PASS "guard receipt present"
+else
+  record_result WARN "no guard receipt found at $GUARD_RECEIPT; guarded writes remain advisory"
+fi
+
+if [[ -f "$OPTIONAL_GUARD_HOOK" ]]; then
+  record_result PASS "optional guard hook sample present"
+else
+  record_result WARN "optional guard hook sample is not present; guarded-write checks remain advisory only"
+fi
+
+# Work Log Phase Summary audit — pure bash, no Python hooks.
+# Sentinel (⚡ ACX) and PreCompact enforcement is model self-attestation per
+# AGENTS.md. Audit happens here at validate-time on archived Work Logs:
+# every archived non-tiny-fix Work Log MUST have a non-empty `## Phase
+# Summary` section (replaces the runtime PreCompact hook intent).
+ARCHIVE_DIR="$ROOT/.agentcortex/context/archive"
+phase_summary_violations=0
+phase_summary_violation_list=""
+if [[ -d "$ARCHIVE_DIR" ]]; then
+  while IFS= read -r -d '' wl; do
+    classification="$(grep -m1 -E '^- \*?\*?Classification\*?\*?:' "$wl" 2>/dev/null | sed -E 's/.*Classification[^:]*:[[:space:]]*`?//; s/`.*//; s/[[:space:]]*$//')" || true
+    [[ "$classification" == "tiny-fix" ]] && continue
+    summary_body="$(awk '/^## Phase Summary/{found=1; next} found && /^## /{exit} found{print}' "$wl" 2>/dev/null | tr -d '[:space:]')"
+    if [[ -z "$summary_body" || "$summary_body" == "none" ]]; then
+      phase_summary_violations=$((phase_summary_violations + 1))
+      phase_summary_violation_list="${phase_summary_violation_list}  empty Phase Summary: ${wl#$ROOT/}\n"
+    fi
+  # Exclude ship-history-*.md (case-insensitive `-iname` for parity with the PS
+  # `-notlike` filter): compacted ship-history archives are not Work Logs and
+  # carry no `## Phase Summary` contract (#171).
+  # Also exclude global-lessons-archive*.md: the /retro chain-aware lesson
+  # archive is not a Work Log and has no '## Phase Summary' contract (#141).
+  done < <(find "$ARCHIVE_DIR" -name '*.md' -not -name '.gitkeep*' -not -iname 'ship-history-*' -not -iname 'global-lessons-archive*' -print0 2>/dev/null || true)
+fi
+if [[ "$phase_summary_violations" -gt 0 ]]; then
+  record_result WARN "archived Work Logs with empty Phase Summary: ${phase_summary_violations}"
+  printf '%b' "$phase_summary_violation_list"
+else
+  record_result PASS "archived Work Logs have non-empty Phase Summary (or none archived yet)"
+fi
+
+# M7: Gate completeness audit for archived Work Logs (bash-only, WARN — historical records).
+# Checks that ship receipts are preceded by minimum required gates. WARN not FAIL
+# because archives are immutable historical records; violations indicate past governance gaps.
+archive_gate_violations=0
+archive_gate_violation_list=""
+if [[ -d "$ARCHIVE_DIR" ]]; then
+  while IFS= read -r -d '' wl; do
+    wl_content="$(cat "$wl" 2>/dev/null)"
+    [[ -z "$wl_content" ]] && continue
+    arc_class="$(<<< "$wl_content" grep -m1 -E '^- \*?\*?[Cc]lassification\*?\*?:' | sed -E 's/.*[Cc]lassification[^:]*:[[:space:]]*`?//; s/`.*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')" || true
+    [[ "$arc_class" == "tiny-fix" ]] && continue
+    if <<< "$wl_content" grep -qiE 'Gate:[[:space:]]*ship[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS'; then
+      arc_has_plan=$(<<< "$wl_content" grep -ciE 'Gate:[[:space:]]*plan[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS') || true
+      arc_has_impl=$(<<< "$wl_content" grep -ciE 'Gate:[[:space:]]*implement[[:space:]]*\|[^|]*Verdict:[[:space:]]*PASS') || true
+      if [[ "$arc_has_plan" -eq 0 ]] || [[ "$arc_has_impl" -eq 0 ]]; then
+        archive_gate_violations=$((archive_gate_violations + 1))
+        archive_gate_violation_list="${archive_gate_violation_list}  archived gate bypass: ${wl#$ROOT/}\n"
+      fi
+    fi
+  done < <(find "$ARCHIVE_DIR" -name '*.md' -not -name '.gitkeep*' -print0 2>/dev/null || true)
+fi
+if [[ "$archive_gate_violations" -gt 0 ]]; then
+  record_result WARN "archived Work Logs with ship receipt but missing plan/implement gates (historical governance gap): ${archive_gate_violations}"
+  printf '%b' "$archive_gate_violation_list"
+else
+  record_result PASS "archived Work Logs gate completeness ok (or none archived yet)"
+fi
+
+# Gate receipt schema validation for archived Work Logs — same §4.5 structural check.
+# WARN only: archives are immutable historical records.
+archive_gate_schema_violations=0
+archive_gate_schema_violation_list=""
+if [[ -d "$ARCHIVE_DIR" ]]; then
+  while IFS= read -r -d '' wl; do
+    wl_name="$(basename "$wl")"
+    while IFS= read -r receipt_line; do
+      if ! printf '%s' "$receipt_line" | grep -qiE '[Vv]erdict[[:space:]]*:'; then
+        archive_gate_schema_violations=$((archive_gate_schema_violations + 1))
+        archive_gate_schema_violation_list="${archive_gate_schema_violation_list}  malformed gate receipt (missing Verdict:) in ${wl_name}\n"
+        break
+      fi
+      if ! printf '%s' "$receipt_line" | grep -qiE '[Cc]lassification[[:space:]]*:'; then
+        archive_gate_schema_violations=$((archive_gate_schema_violations + 1))
+        archive_gate_schema_violation_list="${archive_gate_schema_violation_list}  malformed gate receipt (missing Classification:) in ${wl_name}\n"
+        break
+      fi
+    done < <(grep -iE '^\-[[:space:]]+[Gg]ate[[:space:]]*:' "$wl" 2>/dev/null || true)
+  done < <(find "$ARCHIVE_DIR" -name '*.md' -not -name '.gitkeep*' -print0 2>/dev/null || true)
+fi
+if [[ "$archive_gate_schema_violations" -gt 0 ]]; then
+  record_result WARN "archived Work Log gate receipts missing required fields (Verdict/Classification): ${archive_gate_schema_violations}"
+  printf '%b' "$archive_gate_schema_violation_list"
+else
+  record_result PASS "archived Work Log gate receipts have required fields (or none archived yet)"
+fi
+
+# M8: Relative-link depth check for archived markdown files.
+# Content copy-pasted from current_state.md (at depth 2) into archive/ (depth 3)
+# keeps the original relative paths, which silently break one directory level deeper.
+# Scan all archive/*.md for relative links (not http/https, not anchor-only #...) and
+# verify the resolved target exists. WARN-only — historical archives are immutable.
+if [[ -z "$PYTHON_BIN" ]]; then
+  record_result SKIP "M8 archive relative-link check -- python unavailable"
+elif [[ ! -d "$ARCHIVE_DIR" ]]; then
+  record_result PASS "archived markdown files: no archive directory yet (fresh deploy)"
+elif [[ -n "$PYTHON_BIN" ]] && [[ -d "$ARCHIVE_DIR" ]]; then
+  archive_broken_links=0
+  archive_broken_link_list=""
+  while IFS= read -r -d '' arch_file; do
+    # Python via single-quoted heredoc -> variable (verbatim; no bash metachar parsing)
+    _acx_brokenlink_py=$(cat <<'PYEOF'
+import re, sys
+from pathlib import Path
+f = Path(sys.argv[1])
+try:
+    text = f.read_text(encoding='utf-8', errors='replace')
+except Exception:
+    print(0)
+    sys.exit(0)
+# Match [label](target) where target is not http/https and not anchor-only
+link_re = re.compile(r'\[(?:[^\]]*)\]\(([^)]+)\)')
+count = 0
+for m in link_re.finditer(text):
+    tgt = m.group(1).strip()
+    # Skip external URLs and pure anchors
+    if tgt.startswith(('http://', 'https://')) or tgt.startswith('#'):
+        continue
+    # Strip inline anchor from path
+    path_part = tgt.split('#')[0]
+    if not path_part:
+        continue
+    resolved = (f.parent / path_part).resolve()
+    if not resolved.exists():
+        print(f'  broken relative link in {str(f)}: {tgt}')
+        count += 1
+# Print count as last line so caller reads from stdout (exit-code wraps at 256)
+print(count)
+PYEOF
+)
+    broken_output="$("$PYTHON_BIN" -c "$_acx_brokenlink_py" "$arch_file" 2>/dev/null)"
+    file_count=$(printf '%s\n' "$broken_output" | tail -1)
+    file_count=${file_count:-0}
+    if [[ "$file_count" =~ ^[0-9]+$ ]] && [[ "$file_count" -gt 0 ]]; then
+      archive_broken_links=$((archive_broken_links + file_count))
+      diagnostic=$(printf '%s\n' "$broken_output" | head -n -1)
+      [[ -n "$diagnostic" ]] && archive_broken_link_list="${archive_broken_link_list}${diagnostic}\n"
+    fi
+  done < <(find "$ARCHIVE_DIR" -maxdepth 2 -name '*.md' -not -name '.gitkeep*' -print0 2>/dev/null)
+  if [[ "$archive_broken_links" -gt 0 ]]; then
+    record_result WARN "archived markdown files contain broken relative links (depth mismatch — strip or fix links when archiving from current_state.md): ${archive_broken_links}"
+    printf '%b' "$archive_broken_link_list"
+  else
+    record_result PASS "archived markdown files: no broken relative links detected"
+  fi
+fi
+
+# Persistent SSoT artifacts must stay visible to git. Ask git, not `.gitignore`:
+# a pattern like `docs/specs/*.md` or `.agentcortex/context/archive/*.md` ignores the
+# contents without ever naming the directory, so matching directory lines literally
+# reported a false PASS while the governance record silently stopped being committed
+# (reported by a downstream fork whose archive ignore had exactly that shape).
+#
+# Three flags carry the correctness here, each verified against real git behaviour:
+#   -q          the VERDICT. `-v` exits 0 whenever a pattern MATCHED, including a
+#               negation -- on `docs/adr/*` + `!docs/adr/*.md` (an ordinary idiom)
+#               `-v` exits 0 while `-q` exits 1, and git tracks the file fine. Reading
+#               `-v`'s status as "ignored" fails an adopter whose tree is correct and
+#               names the PROTECTIVE `!` line as the one to remove.
+#   --no-index  without it check-ignore skips TRACKED files, so the one real path here
+#               (`current_state.md`) is inert in every healthy deploy -- a .gitignore
+#               naming it outright would report clean.
+#   -v          message only, run once on the failing path to name source:line.
+#
+# The probes are REPRESENTATIVE, not exhaustive: they are synthetic filenames shaped
+# like each directory's real contents, so a pattern that matches real files but not the
+# probe (`archive/*-worklog.md`) still slips through, and a negation aimed at a narrower
+# name than the probe (`!docs/adr/ADR-2*.md`) can flag a tree that is fine. This catches
+# the whole-directory and whole-extension shapes, which is the class that bit downstream.
+#
+# Deliberately NOT gated on `.gitignore` existing: `.git/info/exclude` and a global
+# core.excludesFile hide files just as effectively, and the branch this replaced
+# claimed "no persistent SSoT artifacts are ignored" without checking anything.
+gitignore_probes=(
+  '.agentcortex/context/current_state.md'
+  '.agentcortex/context/archive/acx-ignore-probe-20260101.md'
+  '.agentcortex/specs/acx-ignore-probe.md'
+  '.agentcortex/adr/ADR-000-acx-ignore-probe.md'
+  'docs/specs/acx-ignore-probe.md'
+  'docs/adr/ADR-000-acx-ignore-probe.md'
+)
+gitignore_errors=0
+gitignore_unknown=0
+gitignore_report=()
+for probe in "${gitignore_probes[@]}"; do
+  set +e
+  git -C "$ROOT" check-ignore -q --no-index -- "$probe" 2>/dev/null
+  probe_status=$?
+  set -e
+  case "$probe_status" in
+    0)
+      gitignore_errors=$((gitignore_errors + 1))
+      set +e
+      probe_source="$(git -C "$ROOT" check-ignore -v --no-index -- "$probe" 2>/dev/null)"
+      set -e
+      gitignore_report+=("  ${probe_source:-$probe}")
+      ;;
+    1) ;;
+    *) gitignore_unknown=$((gitignore_unknown + 1)) ;;
+  esac
+done
+# Re-label only, never re-decide. When EVERY probe is ignored and this tree sits
+# inside a larger repository, the cause is that outer repo hiding the whole
+# directory, and per-probe blame would name its `vendor/`-style rule as "the pattern
+# to remove" -- advice that breaks something load-bearing. This runs after the loop
+# and only when errors>0, so it can never turn a PASS into a FAIL.
+#
+# Deliberately NOT `check-ignore -- .`: a blank CRLF line in .gitignore is the
+# pattern "\r", which git strips to the empty string, and the empty pattern matches
+# the pathspec `.`. Every Git-for-Windows clone (core.autocrlf=true) would then be
+# reported as ignored-by-an-outer-repo on a perfectly healthy tree. Measured, not
+# theorised: `printf '\r\n' > .gitignore` makes that probe exit 0.
+gitignore_outer_prefix=""
+if [[ "$gitignore_errors" -eq "${#gitignore_probes[@]}" ]]; then
+  set +e
+  gitignore_outer_prefix="$(git -C "$ROOT" rev-parse --show-prefix 2>/dev/null)"
+  set -e
+fi
+if [[ "$gitignore_errors" -gt 0 ]]; then
+  printf '%s
+' "${gitignore_report[@]}"
+  if [[ -n "$gitignore_outer_prefix" ]]; then
+    gitignore_fail_message="persistent SSoT artifacts are untracked: every probe is ignored and this project sits at '${gitignore_outer_prefix}' inside a larger repository, so an outer rule (source:line above) is hiding the whole directory and no governance record here can be committed. Fix by running \`git init\` in this directory, or by un-ignoring this path in the outer repository -- do NOT delete that rule blindly, it is probably load-bearing there"
+  else
+    gitignore_tail=""
+    if [[ "$gitignore_unknown" -gt 0 ]]; then
+      gitignore_tail="; ${gitignore_unknown} further probe(s) could not be resolved"
+    fi
+    gitignore_fail_message=".gitignore blocks persistent SSoT artifacts (${gitignore_errors}/${#gitignore_probes[@]} probes ignored; the ignore source:line shown above is the pattern to remove${gitignore_tail})"
+  fi
+  record_result FAIL "$gitignore_fail_message"
+elif [[ "$gitignore_unknown" -gt 0 ]]; then
+  record_result SKIP "persistent SSoT artifacts vs .gitignore -- git check-ignore could not resolve ${gitignore_unknown}/${#gitignore_probes[@]} probes here (not a git work tree, or git unavailable); the check did NOT run"
+else
+  record_result PASS ".gitignore preserves persistent SSoT artifacts"
+fi
+
+# SSoT completeness checks — verify current_state.md indexes match disk reality
+# Always run when current_state.md exists. Projects may legitimately have no ADRs
+# (bootstrap allows skipping /app-init) but still own specs and backlog entries.
+CURRENT_STATE="$ROOT/.agentcortex/context/current_state.md"
+if [[ -f "$CURRENT_STATE" ]]; then
+  cs_content="$(cat "$CURRENT_STATE" 2>/dev/null)" || { record_result WARN "cannot read current_state.md — skipping state checks"; }
+
+  # ADR Index completeness
+  # NOTE: feed awk via here-string, NOT `printf | awk`. awk's `exit` closes the
+  # pipe early; with set -o pipefail the upstream printf's SIGPIPE (141) would
+  # fail the whole script intermittently when $cs_content is large. <<< reads a
+  # temp file, so early exit cannot break a pipe.
+  adr_index_section="$(awk '/\*\*ADR Index\*\*:/{found=1; next} found && /^- \*\*/{exit} found{print}' <<<"$cs_content")"
+  adr_missing_count=0
+  adr_missing_list=""
+  adr_phantom_count=0
+  adr_phantom_list=""
+  for adr_dir in "$ROOT/docs/adr" "$ROOT/.agentcortex/adr"; do
+    if [[ -d "$adr_dir" ]]; then
+      for adr_file in "$adr_dir"/ADR-*.md; do
+        [[ -f "$adr_file" ]] || continue
+        rel_path="${adr_file#$ROOT/}"
+        if ! printf '%s' "$adr_index_section" | grep -qF "$rel_path"; then
+          adr_missing_count=$((adr_missing_count + 1))
+          adr_missing_list="$adr_missing_list  not indexed: $rel_path\n"
+        fi
+      done
+    fi
+  done
+  # Reverse check: indexed ADR paths that no longer exist on disk
+  while IFS= read -r indexed_adr; do
+    [[ -z "$indexed_adr" ]] && continue
+    if [[ ! -f "$ROOT/$indexed_adr" ]]; then
+      adr_phantom_count=$((adr_phantom_count + 1))
+      adr_phantom_list="$adr_phantom_list  phantom index entry: $indexed_adr\n"
+    fi
+  done < <(printf '%s' "$adr_index_section" | grep -oE '[^ ]+\.md' | grep -i 'ADR-')
+  if [[ "$adr_missing_count" -gt 0 || "$adr_phantom_count" -gt 0 ]]; then
+    adr_msg=""
+    [[ "$adr_missing_count" -gt 0 ]] && adr_msg="${adr_missing_count} disk ADR(s) not in index"
+    if [[ "$adr_phantom_count" -gt 0 ]]; then
+      [[ -n "$adr_msg" ]] && adr_msg="$adr_msg; "
+      adr_msg="${adr_msg}${adr_phantom_count} indexed ADR(s) not on disk"
+    fi
+    record_result FAIL "SSoT ADR Index completeness: $adr_msg"
+    printf '%b' "$adr_missing_list"
+    printf '%b' "$adr_phantom_list"
+    echo "  fix: update ADR Index in .agentcortex/context/current_state.md via /ship"
+  else
+    record_result PASS "SSoT ADR Index completeness: all disk ADRs are indexed"
+  fi
+
+  # Spec Index completeness.
+  # Scope = the live index block PLUS the `## Spec Index Archive` section, which
+  # ship.md §State Update collapses over-cap shipped entries into. A folded entry
+  # is still an index entry here; it is only excluded from the bootstrap auto-read.
+  # Without the second pass the documented collapse remedy turns this check into a
+  # FAIL, so the remedy was un-executable and had never been run (#143).
+  # The live-index pass also stops at `^##` (any heading depth, matching
+  # validate.ps1's `\n##` lookahead) — otherwise an archive section placed adjacent
+  # to the index rather than at file bottom is read on one platform only.
+  # `!found` on the archive header keeps a duplicated header from re-arming capture:
+  # awk would otherwise union every such section while ps1's -match takes the first,
+  # so a second section would be indexed on Linux and FAIL on Windows.
+  spec_index_section="$(awk '/\*\*Spec Index\*\*/{found=1; next} found && (/^- \*\*/ || /^##/){exit} found{print}' <<<"$cs_content")
+$(awk '!found && /^## Spec Index Archive/{found=1; next} found && /^##/{exit} found{print}' <<<"$cs_content")"
+  spec_missing_count=0
+  spec_missing_list=""
+  for spec_dir in "$ROOT/docs/specs" "$ROOT/.agentcortex/specs"; do
+    if [[ -d "$spec_dir" ]]; then
+      for spec_file in "$spec_dir"/*.md; do
+        [[ -f "$spec_file" ]] || continue
+        basename_spec="$(basename "$spec_file")"
+        # Skip files starting with _
+        [[ "$basename_spec" == _* ]] && continue
+        # Skip files with status: draft, frozen, or cancelled in frontmatter
+        # (pre-ship intermediate states — not yet required in Spec Index; /ship indexes on ship)
+        if grep -qm1 '^status:[[:space:]]*\(draft\|frozen\|cancelled\)' "$spec_file" 2>/dev/null; then
+          continue
+        fi
+        rel_path="${spec_file#$ROOT/}"
+        if ! printf '%s' "$spec_index_section" | grep -qF "$rel_path"; then
+          spec_missing_count=$((spec_missing_count + 1))
+          spec_missing_list="$spec_missing_list  not indexed: $rel_path\n"
+        fi
+      done
+    fi
+  done
+  # Reverse check: indexed spec paths that no longer exist on disk
+  spec_phantom_count=0
+  spec_phantom_list=""
+  while IFS= read -r indexed_spec; do
+    [[ -z "$indexed_spec" ]] && continue
+    if [[ ! -f "$ROOT/$indexed_spec" ]]; then
+      spec_phantom_count=$((spec_phantom_count + 1))
+      spec_phantom_list="$spec_phantom_list  phantom index entry: $indexed_spec\n"
+    fi
+    # Extract indexed spec paths format-robustly: anchor on the spec dirs, NOT
+    # on a preceding "]" — real index entries put the path before the [Shipped]
+    # tag (`- docs/specs/X.md — ..., [Shipped ...]`), so the old bracket-anchored
+    # sed matched nothing and this reverse check was silently dead. Mirror the
+    # ADR reverse check's robust extraction.
+  done < <(printf '%s' "$spec_index_section" | grep -oE '(docs/specs|\.agentcortex/specs)/[^[:space:]]+\.md')
+  if [[ "$spec_missing_count" -gt 0 || "$spec_phantom_count" -gt 0 ]]; then
+    spec_msg=""
+    [[ "$spec_missing_count" -gt 0 ]] && spec_msg="${spec_missing_count} shipped/living spec(s) not in index"
+    if [[ "$spec_phantom_count" -gt 0 ]]; then
+      [[ -n "$spec_msg" ]] && spec_msg="$spec_msg; "
+      spec_msg="${spec_msg}${spec_phantom_count} indexed spec(s) not on disk"
+    fi
+    record_result FAIL "SSoT Spec Index completeness: $spec_msg"
+    printf '%b' "$spec_missing_list"
+    printf '%b' "$spec_phantom_list"
+    echo "  fix: update Spec Index in .agentcortex/context/current_state.md via /ship"
+  else
+    record_result PASS "SSoT Spec Index completeness: all shipped/living specs are indexed"
+  fi
+
+  # Active Backlog consistency
+  PRODUCT_BACKLOG="$ROOT/docs/specs/_product-backlog.md"
+  if [[ -f "$PRODUCT_BACKLOG" ]]; then
+    if printf '%s' "$cs_content" | grep -qE '^- \*\*Active Backlog\*\*:[[:space:]]*none'; then
+      record_result FAIL 'SSoT Active Backlog consistency: _product-backlog.md exists but SSoT Active Backlog is "none"'
+      echo '  fix: set Active Backlog to `docs/specs/_product-backlog.md` in current_state.md via /ship'
+    else
+      # Path-value mismatch check: SSoT must reference docs/specs/_product-backlog.md
+      backlog_ref_actual="$(printf '%s' "$cs_content" | sed -n 's/^- \*\*Active Backlog\*\*:[[:space:]]*`\([^`]*\)`.*/\1/p')"
+      if [[ -n "$backlog_ref_actual" && "$backlog_ref_actual" != "docs/specs/_product-backlog.md" ]]; then
+        record_result FAIL "SSoT Active Backlog consistency: SSoT Active Backlog references '$backlog_ref_actual' but actual backlog is at docs/specs/_product-backlog.md"
+        echo '  fix: set Active Backlog to `docs/specs/_product-backlog.md` in current_state.md via /ship'
+      else
+        record_result PASS "SSoT Active Backlog consistency: backlog file and SSoT are consistent"
+      fi
+    fi
+  else
+    # Reverse check: SSoT references a backlog file that doesn't exist
+    backlog_ref="$(printf '%s' "$cs_content" | sed -n 's/^- \*\*Active Backlog\*\*:[[:space:]]*`\([^`]*\)`.*/\1/p')"
+    if [[ -n "$backlog_ref" && ! -f "$ROOT/$backlog_ref" ]]; then
+      record_result FAIL "SSoT Active Backlog consistency: SSoT references '$backlog_ref' but file does not exist"
+      echo "  fix: update Active Backlog in current_state.md via /ship or create the missing file"
+    else
+      record_result PASS "SSoT Active Backlog consistency: no backlog file on disk"
+    fi
+  fi
+else
+  record_result WARN "SSoT completeness checks skipped: current_state.md not found"
+fi
+
+# Backlog Feature Inventory check (MEDIUM-2): spec-intake multi-feature decomposition gate
+# requires a ## Feature Inventory section per AGENTS.md §Delivery Gates.
+BACKLOG_FILE="$ROOT/docs/specs/_product-backlog.md"
+if [[ -f "$BACKLOG_FILE" ]]; then
+  if ! grep -qiE '^#+[[:space:]]+Feature Inventory' "$BACKLOG_FILE" 2>/dev/null; then
+    record_result WARN "backlog missing Feature Inventory section: _product-backlog.md exists but has no '## Feature Inventory' heading -- spec-intake multi-feature decomposition gate may have been skipped"
+  else
+    record_result PASS "backlog Feature Inventory section present"
+  fi
+fi
+
+# Backlog schema check: verify Kind/Labels/Priority columns present when backlog exists
+if [[ -f "$BACKLOG_FILE" ]]; then
+  backlog_header="$(grep -m1 '|.*Feature.*|' "$BACKLOG_FILE" 2>/dev/null || true)"
+  missing_cols=()
+  echo "$backlog_header" | grep -q 'Kind'     || missing_cols+=("Kind")
+  echo "$backlog_header" | grep -q 'Labels'   || missing_cols+=("Labels")
+  echo "$backlog_header" | grep -q 'Priority' || missing_cols+=("Priority")
+  if [[ ${#missing_cols[@]} -eq 0 ]]; then
+    record_result PASS "backlog schema: Kind/Labels/Priority columns present"
+
+    # L-1: P0 ratio lint — warn if >20% of pending items are P0
+    # NOTE: grep -c outputs "0" + exit 1 when no matches; `|| echo 0` then appends
+    # another "0" → `total_pending="0\n0"` breaks `[[ ]]`. tr -d '\n' coalesces.
+    total_pending=$(grep -c '| Pending' "$BACKLOG_FILE" 2>/dev/null | tr -d '\n' || echo 0)
+    p0_pending=$(grep '| Pending' "$BACKLOG_FILE" 2>/dev/null | grep -c '| P0 |' | tr -d '\n' || echo 0)
+    total_pending="${total_pending:-0}"
+    p0_pending="${p0_pending:-0}"
+    if [[ "$total_pending" -gt 4 && "$p0_pending" -gt 0 ]]; then
+      p0_ratio=$(( p0_pending * 100 / total_pending ))
+      if [[ "$p0_ratio" -gt 20 ]]; then
+        record_result WARN "backlog P0 ratio: ${p0_pending}/${total_pending} pending items are P0 (${p0_ratio}% > 20% threshold — consider downgrading some)"
+      else
+        record_result PASS "backlog P0 ratio: ${p0_pending}/${total_pending} pending items are P0 (${p0_ratio}%)"
+      fi
+    fi
+
+    # L-3: Kind distribution sanity — warn if all non-— rows have Kind=feature (no review-finding/hotfix-spawn ever written)
+    if [[ "$total_pending" -gt 9 ]]; then
+      kind_variety=$(grep '| Pending' "$BACKLOG_FILE" 2>/dev/null | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4); print $4}' | grep -vE '^[[:space:]]*(—)?[[:space:]]*$' | sort -u | wc -l | tr -d '[:space:]')
+      kind_variety=${kind_variety:-0}
+      if [[ "$kind_variety" -eq 1 ]]; then
+        record_result WARN "backlog Kind diversity: all assigned pending items share the same Kind value — review-finding and hotfix-spawn entries may not be reaching the backlog"
+      else
+        record_result PASS "backlog Kind diversity: ${kind_variety} distinct Kind values in use"
+      fi
+    fi
+
+    # L-3b: schema-zero guard — L-3 silently PASSes when ALL pending items have Kind=—
+    # (kind_variety=0 ≠ 1, so falls to the PASS branch without surfacing the empty schema).
+    if [[ "$total_pending" -gt 5 ]]; then
+      kind_assigned=$(grep '| Pending' "$BACKLOG_FILE" 2>/dev/null | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $4); if ($4 != "—" && $4 != "") print}' | wc -l | tr -d '[:space:]')
+      kind_assigned=${kind_assigned:-0}
+      if [[ "$kind_assigned" -eq 0 ]]; then
+        record_result WARN "backlog Kind schema-zero: all ${total_pending} pending items have Kind=— — populate Kind column to enable cluster routing and L-3 diversity checks"
+      fi
+    fi
+
+    # L-2: label vocabulary drift — warn if distinct label count exceeds max_distinct_labels (default 15)
+    # ACTIVE rows = Pending OR In Progress, anchored as a whole cell between column
+    # pipes with TOLERANT padding — a literal space and a literal TAB — rather than
+    # demanding exactly one space. (Deliberately NOT `[[:space:]]`: POSIX and .NET
+    # whitespace shorthands disagree on Unicode blanks, so the twins would diverge on
+    # an NBSP-padded backlog. tests/ci/test_validator_twin_parity.py pins this.) A rigid ` X ` anchor selects
+    # rows whose padding is wider than one space — on a column-aligned backlog it keeps
+    # only the rows whose status happens to be the widest value, so the count is
+    # silently PARTIAL and still reported as a PASS. (An earlier note here said it
+    # emits nothing; measured, it is the wrong-number case, which is worse to spot.)
+    # The backlog's own header defines active work as Pending / In Progress, and an
+    # In-Progress row's labels are part of the active vocabulary this check exists to
+    # watch, so the row set stays wide. What was actually broken (#174) is that the old
+    # `| Pending\|In Progress` gave the second alternative NO leading pipe-space, so it
+    # matched those words anywhere in a row — a Notes cell counted as a match. The
+    # anchored form fixes that without narrowing coverage, and validate.ps1 uses the
+    # same row set for this one check (its $pendingRows stays Pending-only for L-1/L-3).
+    distinct_labels=$(grep -E '\|[ 	]*(Pending|In Progress)[ 	]*\|' "$BACKLOG_FILE" 2>/dev/null | awk -F'|' '{print $5}' | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -v '^—$' | grep -v '^$' | sort -u | wc -l | tr -d '[:space:]' || true)
+    distinct_labels=${distinct_labels:-0}
+    if [[ "$distinct_labels" -gt 15 ]]; then
+      record_result WARN "backlog label vocabulary: ${distinct_labels} distinct labels (>15) — possible drift across sessions; review and consolidate via /spec-intake"
+    elif [[ "$distinct_labels" -gt 0 ]]; then
+      record_result PASS "backlog label vocabulary: ${distinct_labels} distinct labels"
+    fi
+
+    # L-4: cluster-declined marker GC — warn if too many suppressions accumulated
+    declined_count=$(grep -c 'cluster-declined:' "$BACKLOG_FILE" 2>/dev/null | tr -d '[:space:]') || true
+    declined_count=${declined_count:-0}
+    if [[ "$declined_count" -gt 5 ]]; then
+      record_result WARN "backlog cluster-declined: ${declined_count} suppression markers (>5) — review expired/stale suppressions in _product-backlog.md ## Source Summary"
+    elif [[ "$declined_count" -gt 0 ]]; then
+      record_result PASS "backlog cluster-declined: ${declined_count} suppression marker(s)"
+    fi
+  else
+    record_result WARN "backlog schema: missing column(s): ${missing_cols[*]}"
+    echo "  fix: run /spec-intake to trigger merge-guard backfill, or add columns manually"
+    echo "  manual fix: add columns to Feature Inventory header row and backfill existing rows with —"
+  fi
+fi
+
+# Backlog structure validation (#18): frontmatter fields, structural columns, Status enum, spec links.
+# Catches structural corruption that would break /spec-intake feature matching but is invisible
+# to the existence-only checks above.
+if [[ -f "$BACKLOG_FILE" ]]; then
+  # (1) YAML frontmatter required fields: title, created, status
+  backlog_fm="$(awk 'NR==1 && /^---[[:space:]]*$/ {infm=1; next} infm && /^---[[:space:]]*$/ {exit} infm {print}' "$BACKLOG_FILE")"
+  fm_missing=()
+  printf '%s\n' "$backlog_fm" | grep -qE '^title:'   || fm_missing+=("title")
+  printf '%s\n' "$backlog_fm" | grep -qE '^created:' || fm_missing+=("created")
+  printf '%s\n' "$backlog_fm" | grep -qE '^status:'  || fm_missing+=("status")
+  if [[ ${#fm_missing[@]} -eq 0 ]]; then
+    record_result PASS "backlog frontmatter: required fields (title, created, status) present"
+  else
+    record_result FAIL "backlog frontmatter: missing required field(s): ${fm_missing[*]}"
+    echo "  fix: add the missing field(s) to the YAML frontmatter of _product-backlog.md"
+  fi
+
+  # (2) Feature Inventory structural columns: #, Status, Tier (complements Kind/Labels/Priority above)
+  backlog_hdr="$(grep -m1 '|.*Feature.*|' "$BACKLOG_FILE" 2>/dev/null || true)"
+  struct_missing=()
+  echo "$backlog_hdr" | grep -qE '\|[[:space:]]*#[[:space:]]*\|' || struct_missing+=("#")
+  echo "$backlog_hdr" | grep -q 'Status' || struct_missing+=("Status")
+  echo "$backlog_hdr" | grep -q 'Tier'   || struct_missing+=("Tier")
+  if [[ ${#struct_missing[@]} -eq 0 ]]; then
+    record_result PASS "backlog structure: #/Status/Tier columns present"
+  else
+    record_result WARN "backlog structure: missing column(s): ${struct_missing[*]}"
+  fi
+
+  # (3) Status enum compliance: every numbered Feature Inventory row uses a known Status value.
+  # The enum token is matched as an isolated `| <status> |` cell anywhere in the row rather than
+  # by fixed column index — safe because no other column holds a bare enum word as an isolated
+  # cell (Dependencies use —/#N/dates, Spec File holds paths, Feature holds prose).
+  bad_status=""
+  while IFS= read -r brow; do
+    echo "$brow" | grep -qE '^\|[[:space:]]*[0-9]+[[:space:]]*\|' || continue
+    if ! echo "$brow" | grep -qE '\|[[:space:]]*(Pending|In Progress|Shipped|Deferred|Cancelled)[[:space:]]*\|'; then
+      bnum="$(echo "$brow" | sed -E 's/^\|[[:space:]]*([0-9]+).*/\1/')"
+      bad_status="${bad_status} #${bnum}"
+    fi
+  done < "$BACKLOG_FILE"
+  if [[ -n "$bad_status" ]]; then
+    record_result FAIL "backlog Status enum: row(s)${bad_status} have a Status not in {Pending, In Progress, Shipped, Deferred, Cancelled}"
+    echo "  fix: correct the Status cell to a valid enum value in _product-backlog.md"
+  else
+    record_result PASS "backlog Status enum: all Feature Inventory rows use valid Status values"
+  fi
+
+  # (4) Spec link existence: referenced docs/specs/*.md files should exist on disk
+  missing_specs=""
+  while IFS= read -r sref; do
+    [[ -z "$sref" ]] && continue
+    if [[ ! -f "$ROOT/$sref" ]]; then
+      case " $missing_specs " in *" $sref "*) ;; *) missing_specs="${missing_specs} $sref";; esac
+    fi
+  done < <(grep -oE 'docs/specs/[A-Za-z0-9._/-]+\.md' "$BACKLOG_FILE" 2>/dev/null | sort -u)
+  if [[ -n "$missing_specs" ]]; then
+    record_result WARN "backlog spec links: referenced spec file(s) not found:${missing_specs} (pending features may not have specs yet)"
+  else
+    record_result PASS "backlog spec links: all referenced spec files exist"
+  fi
+fi
+
+# Routing index governance split checks
+ROUTING_INDEX="$WORKFLOWS_DIR/routing.md"
+if [[ -f "$ROUTING_INDEX" ]]; then
+  record_result PASS "routing index present at .agent/workflows/routing.md"
+  check_contains_literal \
+    "$ROUTING_INDEX" \
+    'canonical: true' \
+    "routing index declares canonical authority" \
+    "routing index missing canonical authority marker"
+  check_contains_literal \
+    "$ROUTING_INDEX" \
+    'AGENTS.md outranks' \
+    "routing index acknowledges AGENTS.md precedence" \
+    "routing index missing AGENTS.md precedence acknowledgment"
+else
+  record_result FAIL "routing index missing at .agent/workflows/routing.md"
+fi
+check_contains_literal \
+  "$PROJECT_AGENTS_FILE" \
+  '.agent/workflows/routing.md' \
+  "AGENTS.md references routing index (authority handoff present)" \
+  "AGENTS.md missing routing index reference (authority handoff absent)"
+check_contains_literal \
+  "$WORKFLOWS_DIR/commands.md" \
+  '.agent/workflows/routing.md' \
+  "commands.md points to canonical routing index" \
+  "commands.md missing canonical routing index reference"
+
+# Security scanning workflow presence check (AC-8 of ci-security-scanning spec)
+# Only relevant for repos using GitHub Actions (skip for non-Actions repos)
+SECURITY_WORKFLOW="$ROOT/.github/workflows/security.yml"
+if [[ -d "$ROOT/.github/workflows" ]]; then
+  if [[ -f "$SECURITY_WORKFLOW" ]]; then
+    record_result PASS "security scanning workflow present at .github/workflows/security.yml"
+  else
+    record_result WARN "security scanning workflow absent — .github/workflows/security.yml not found (add SAST + secret detection + dependency audit to protect this repo)"
+  fi
+fi
+
+# Document lifecycle bloat checks
+GLOBAL_LESSONS_MAX="${GLOBAL_LESSONS_MAX:-20}"
+if [[ -f "$CURRENT_STATE" ]]; then
+  lessons_count="$(grep -c '^\- \[Category:' "$CURRENT_STATE" 2>/dev/null || true)"
+  if [[ "$lessons_count" -gt "$GLOBAL_LESSONS_MAX" ]]; then
+    record_result WARN "Global Lessons exceeds cap (${lessons_count} > ${GLOBAL_LESSONS_MAX}); run /retro to archive LOW-severity entries"
+  elif [[ "$lessons_count" -gt 0 ]]; then
+    record_result PASS "Global Lessons count within cap (${lessons_count}/${GLOBAL_LESSONS_MAX})"
+  fi
+fi
+
+# Ship History pending-SHA guard: commit references must be resolved SHAs.
+# "pending" is a valid placeholder only during the ship branch; after merge
+# it must be replaced with the real SHA. Warn so CI surfaces the gap.
+if [[ -f "$CURRENT_STATE" ]]; then
+  pending_sha_count="$(grep -c '^- Commits: pending' "$CURRENT_STATE" 2>/dev/null | tr -d '\n' || echo 0)"
+  pending_sha_count="${pending_sha_count:-0}"
+  if [[ "$pending_sha_count" -gt 0 ]]; then
+    record_result WARN "Ship History has ${pending_sha_count} unresolved 'pending' commit reference(s) — replace with real SHAs after merge"
+  else
+    record_result PASS "Ship History commit references are all resolved"
+  fi
+fi
+
+# Stale _raw-intake check: if a backlog exists with all features Shipped/Cancelled
+# but _raw-intake*.md files still linger, that's dead data.
+if [[ -d "$ROOT/docs/specs" ]]; then
+  stale_raw_intake=0
+  for ri in "$ROOT"/docs/specs/_raw-intake*.md; do
+    [[ -f "$ri" ]] || continue
+    stale_raw_intake=$((stale_raw_intake + 1))
+  done
+  if [[ "$stale_raw_intake" -gt 0 ]]; then
+    record_result WARN "stale _raw-intake files detected: ${stale_raw_intake} — /ship should clean these up"
+  fi
+fi
+
+# Project spec template check (#172): detect a genuine downstream app that has
+# run /app-init by the presence of its project-architecture ADR
+# (docs/adr/ADR-00N-project-architecture.md, created by app-init.md §4). The
+# framework's own governance ADRs (ADR-001-governance-friction-tuning, ..) do
+# NOT match this pattern, so these app-init-derived checks never false-fire on
+# the framework repo itself. This signal is deploy-independent, so it also
+# covers fork/clone adopters (README §Additive Fork) that never run deploy.sh.
+# If app-init ran but the template / Project Name is missing, WARN.
+app_init_adr_count=0
+for adr_dir in "$ROOT/docs/adr" "$ROOT/.agentcortex/adr"; do
+  if [[ -d "$adr_dir" ]]; then
+    for f in "$adr_dir"/*-project-architecture.md; do [[ -f "$f" ]] && app_init_adr_count=$((app_init_adr_count + 1)); done
+  fi
+done
+if [[ "$app_init_adr_count" -gt 0 ]]; then
+  has_project_template=0
+  for tmpl in "$ROOT"/.agentcortex/templates/spec-app-feature-*.md; do
+    [[ -f "$tmpl" ]] && has_project_template=1 && break
+  done
+  if [[ "$has_project_template" -eq 0 ]]; then
+    record_result WARN "project spec template missing: docs/adr/ has ADR(s) but no .agentcortex/templates/spec-app-feature-<project>.md found — run /app-init to create one, or spec-intake will use the generic template"
+  else
+    record_result PASS "project spec template present alongside ADR(s)"
+  fi
+  # Round-15 Finding 1/10: Project Name SSoT presence check — if /app-init ran,
+  # current_state.md must have a non-empty, non-placeholder Project Name field.
+  cs_file="$ROOT/.agentcortex/context/current_state.md"
+  if [[ -f "$cs_file" ]]; then
+    proj_name="$(grep -m1 -i '\*\*Project Name\*\*:' "$cs_file" | sed 's/.*Project Name\*\*:[[:space:]]*//' | tr -d '\r' | xargs)" || true
+    if [[ -z "$proj_name" || "$proj_name" == "(set by /app-init)" ]]; then
+      record_result WARN "Project Name field absent or placeholder in current_state.md — /app-init has run (ADRs exist) but SSoT Project Name was not set; spec-intake will fall back to glob template resolution"
+    else
+      record_result PASS "SSoT Project Name is set: ${proj_name}"
+    fi
+  fi
+fi
+
+# Round-16 Finding 7: Domain Decisions entry cap — spec.md §8 hard cap is 10 entries.
+# Each [DECISION], [TRADEOFF], or [CONSTRAINT] line counts toward the cap.
+domain_decisions_exceeded=0
+if [[ -d "$ROOT/docs/specs" ]]; then
+  shopt -s nullglob
+  for spec in "$ROOT/docs/specs"/*.md; do
+    [[ -f "$spec" ]] || continue
+    [[ "$(basename "$spec")" == ".gitkeep.md" ]] && continue
+    if grep -q '^## Domain Decisions' "$spec"; then
+      entry_count="$(awk '/^## Domain Decisions/{found=1;next} found && /^## /{exit} found && /\[(DECISION|TRADEOFF|CONSTRAINT)\]/{c++} END{print c+0}' "$spec")"
+      if [[ "$entry_count" -gt 10 ]]; then
+        printf '  spec Domain Decisions cap exceeded: %s (%d entries > 10)\n' "$(basename "$spec")" "$entry_count"
+        domain_decisions_exceeded=$((domain_decisions_exceeded + 1))
+      fi
+    fi
+  done
+  shopt -u nullglob
+fi
+if [[ "$domain_decisions_exceeded" -gt 0 ]]; then
+  record_result WARN "docs/specs/ files with Domain Decisions exceeding 10-entry cap (spec.md §8 — requires user acknowledgment): ${domain_decisions_exceeded}"
+else
+  spec_dd_count=0
+  for f in "$ROOT/docs/specs"/*.md; do grep -q '^## Domain Decisions' "$f" 2>/dev/null && spec_dd_count=$((spec_dd_count + 1)); done
+  [[ "$spec_dd_count" -gt 0 ]] && record_result PASS "all specs with Domain Decisions sections are within 10-entry cap"
+fi
+
+# Round-15 Finding 7: Spec frontmatter status validation — each docs/specs/*.md
+# must have YAML frontmatter with a recognized 'status:' value.
+VALID_SPEC_STATUSES="draft|frozen|shipped|cancelled|living"
+spec_bad_status=0
+spec_missing_frontmatter=0
+spec_file_count=0
+if [[ -d "$ROOT/docs/specs" ]]; then
+  shopt -s nullglob
+  for spec in "$ROOT/docs/specs"/*.md; do
+    [[ -f "$spec" ]] || continue
+    # Skip .gitkeep.md placeholder files
+    [[ "$(basename "$spec")" == ".gitkeep.md" ]] && continue
+    # Skip underscore-prefixed meta/index files (_product-backlog*, _research-*):
+    # not governed specs; they use their own lifecycle states (archive/research)
+    # and are exempt from the spec-status enum, matching the `_*` skip convention
+    # already used for the Spec Index completeness check above (#170).
+    [[ "$(basename "$spec")" == _* ]] && continue
+    # Counted here, past both skips: this is the set of GOVERNED specs, and it is what
+    # gates the PASS below (validate.ps1 increments at the same point).
+    spec_file_count=$((spec_file_count + 1))
+    # Check YAML frontmatter presence (first line must be ---)
+    first_line="$(head -n1 "$spec" 2>/dev/null | tr -d '\r')"
+    if [[ "$first_line" != "---" ]]; then
+      spec_missing_frontmatter=$((spec_missing_frontmatter + 1))
+      continue
+    fi
+    # Extract status: value from frontmatter
+    status_val="$(awk '/^---/{if(n++) exit} /^status:/{print}' "$spec" | sed 's/status:[[:space:]]*//' | tr -d '\r' | xargs)"
+    if [[ -z "$status_val" ]]; then
+      spec_missing_frontmatter=$((spec_missing_frontmatter + 1))
+    elif ! printf '%s' "$status_val" | grep -qE "^(${VALID_SPEC_STATUSES})$"; then
+      spec_bad_status=$((spec_bad_status + 1))
+    fi
+  done
+  shopt -u nullglob
+fi
+if [[ "$spec_missing_frontmatter" -gt 0 ]]; then
+  record_result WARN "docs/specs/ files missing YAML frontmatter or status field: ${spec_missing_frontmatter} (engineering_guardrails.md §4.2 requires status: draft|frozen|shipped|cancelled)"
+elif [[ "$spec_bad_status" -gt 0 ]]; then
+  record_result WARN "docs/specs/ files with unrecognized status value: ${spec_bad_status} (valid: draft, frozen, shipped, cancelled, living)"
+elif [[ "$spec_file_count" -gt 0 ]]; then
+  # PASS only when GOVERNED specs were actually checked. This reuses the scanning loop's
+  # own counter instead of re-globbing: the old bare glob counted the `_*` meta files the
+  # scanning loop had just skipped, so a fresh downstream whose docs/specs/ holds only
+  # those got a PASS asserting valid frontmatter over ZERO governed specs (#174). (Not
+  # `.gitkeep.md` — bash `*.md` never matches a dotfile without dotglob; see below.) validate.ps1
+  # already counted inside its filtered loop, so this also closes the twin divergence.
+  record_result PASS "all docs/specs/ files have valid status frontmatter"
+else
+  # And SKIP, not silence, when there are none. Dropping the vacuous PASS without saying
+  # anything would trade one defect for the other: ratchet justification #7 (backlog
+  # #149) records that a check emitting NOTHING while the summary still prints "integrity
+  # check passed" IS the defect. An adopter who has run /spec-intake but written no spec
+  # yet should see that this check found nothing to check, not nothing at all.
+  # Precision on the original bug, since an earlier note here overstated it: bash `*.md`
+  # never matches a dotfile without `dotglob`, so the old re-glob could NOT have counted
+  # `.gitkeep.md`. The `_*` meta files alone were the whole defect.
+  record_result SKIP "docs/specs/ status frontmatter -- no governed specs present (meta/_* and .gitkeep.md excluded)"
+fi
+
+# ACX phase shim skill-existence check: for each .claude/agents/acx-*.md,
+# verify that any skill name listed under skills: which maps to a .agent/skills/
+# stub file actually has a SKILL.md body in .agents/skills/. Claude Code
+# built-in skills (no corresponding stub file) are silently skipped.
+AGENTS_DIR="$ROOT/.claude/agents"
+if [[ -d "$AGENTS_DIR" ]]; then
+  shim_skill_errors=0
+  shim_count=0
+  shopt -s nullglob
+  for shim in "$AGENTS_DIR"/acx-*.md; do
+    [[ -f "$shim" ]] || continue
+    shim_count=$((shim_count + 1))
+    in_frontmatter=0
+    in_skills=0
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      [[ "$line" == "---" ]] && { in_frontmatter=$(( 1 - in_frontmatter )); in_skills=0; continue; }
+      [[ "$in_frontmatter" -eq 0 ]] && break
+      if [[ "$line" =~ ^skills: ]]; then in_skills=1; continue; fi
+      if [[ "$in_skills" -eq 1 ]]; then
+        if [[ "$line" =~ ^[[:space:]]+-[[:space:]]+(.+)$ ]]; then
+          skill_name="${BASH_REMATCH[1]%$'\r'}"
+          skill_dir="$ROOT/.agent/skills/$skill_name"
+          if [[ -f "$skill_dir" ]]; then
+            if [[ ! -f "$ROOT/.agents/skills/$skill_name/SKILL.md" ]]; then
+              printf '  shim skill missing SKILL.md: %s (referenced in %s)\n' "$skill_name" "$(basename "$shim")"
+              shim_skill_errors=$((shim_skill_errors + 1))
+            fi
+          fi
+        elif [[ ! "$line" =~ ^[[:space:]] ]]; then
+          in_skills=0
+        fi
+      fi
+    done < "$shim"
+  done
+  shopt -u nullglob
+  if [[ "$shim_count" -eq 0 ]]; then
+    record_result SKIP "acx phase shim skill check -- no acx-*.md shims found in .claude/agents/"
+  elif [[ "$shim_skill_errors" -gt 0 ]]; then
+    record_result FAIL "acx phase shim skill references are broken: ${shim_skill_errors} missing SKILL.md"
+  else
+    record_result PASS "acx phase shim skill references are all valid (${shim_count} shims checked)"
+  fi
+else
+  record_result SKIP "acx phase shim skill check -- .claude/agents/ not present"
+fi
+
+# Governance eval coverage advisory (AC-7): capability-by-presence.
+# If .agentcortex/eval/governance.yaml exists AND python is available, run
+# run_governance_eval.py --coverage --format json and WARN with the count of
+# MUST-rule sections that have zero guarding cases. Never FAIL; silent skip
+# when the eval file or python is absent. Zero zero-coverage rules → PASS.
+ACX_EVAL_YAML="$ROOT/.agentcortex/eval/governance.yaml"
+ACX_EVAL_RUNNER="$ROOT/.agentcortex/tools/run_governance_eval.py"
+if [[ -f "$ACX_EVAL_YAML" ]]; then
+  if [[ -z "${PYTHON_BIN:-}" ]]; then
+    record_result SKIP "governance eval coverage -- python unavailable (install Python 3.9+ for full validation)" || true
+  elif [[ ! -f "$ACX_EVAL_RUNNER" ]]; then
+    record_result SKIP "governance eval coverage -- runner not present (run_governance_eval.py missing)" || true
+  else
+    # Coverage mode emits text; parse the "Zero-coverage rules:" line.
+    _eval_cov_text="$("$PYTHON_BIN" "$ACX_EVAL_RUNNER" --coverage 2>&1)" || true
+    _eval_zero_count="$(printf '%s' "$_eval_cov_text" | grep -oE 'Zero-coverage rules: [0-9]+' | grep -oE '[0-9]+' | head -1)"
+    _eval_zero_count="${_eval_zero_count:-0}"
+    if [[ "$_eval_zero_count" -gt 0 ]]; then
+      record_result WARN "governance eval coverage: ${_eval_zero_count} MUST-rule section(s) without eval cases (tier-blind: includes machine-enforced and principle-tier rules; see guardrails s13)" || true
+      print_indented_output "$(printf '%s' "$_eval_cov_text" | grep -A9999 'Rules with zero guarding cases:' | head -20)" || true
+    else
+      record_result PASS "governance eval coverage: 0 MUST-rule section(s) with zero guarding cases" || true
+    fi
+  fi
+fi
+
+# Token lifecycle drift advisory (backlog #51 / issue #157): capability-by-presence.
+# If the baseline exists AND python is available, run update_lifecycle_baseline.py
+# --dry-run and WARN when any scenario/aggregate GREW beyond slack (advisory, never
+# FAIL). Baseline absent -> WARN to seed. Shrink is intentionally not flagged
+# (trimming token cost is good). Teeth live in tests/ci/test_lifecycle_baseline_drift.py.
+# Updater-absence is tested FIRST: neither the baseline nor the updater is deployed
+# downstream, so testing baseline-absence first made every adopter hit a permanent WARN
+# telling them to run a tool their tree does not contain -- the honest SKIP below it was
+# unreachable. Order is updater -> baseline -> python; the baseline/python order is
+# deliberately left as-is (changing it is a separate semantic change, not this defect).
+ACX_LIFECYCLE_BASELINE="$ROOT/.agentcortex/metadata/lifecycle-baseline.json"
+ACX_LIFECYCLE_UPDATER="$ROOT/.agentcortex/tools/update_lifecycle_baseline.py"
+if [[ ! -f "$ACX_LIFECYCLE_UPDATER" ]]; then
+  record_result SKIP "token lifecycle drift -- updater not present; not deployed downstream by design (safe to ignore there)" || true
+elif [[ ! -f "$ACX_LIFECYCLE_BASELINE" ]]; then
+  record_result WARN "token lifecycle baseline absent (.agentcortex/metadata/lifecycle-baseline.json); seed with update_lifecycle_baseline.py --init" || true
+elif [[ -z "${PYTHON_BIN:-}" ]]; then
+  record_result SKIP "token lifecycle drift -- python unavailable or disabled (--no-python)" || true
+else
+  _acx_drift_out="$("$PYTHON_BIN" "$ACX_LIFECYCLE_UPDATER" --root "$ROOT" --dry-run 2>&1)" && _acx_drift_status=0 || _acx_drift_status=$?
+  if [[ "$_acx_drift_status" -eq 0 ]]; then
+    record_result PASS "token lifecycle drift: within slack" || true
+  else
+    record_result WARN "token lifecycle drift or detector error (advisory, never FAIL); see output. If drift is intended, re-baseline: update_lifecycle_baseline.py --apply" || true
+    print_indented_output "$_acx_drift_out" || true
+  fi
+fi
+
+# AC-6: governance specs missing signal_tier frontmatter (guardrails §13 ADD-Gate).
+# Advisory WARN only — never FAIL. Checks docs/specs/*.md (skips _* meta/index
+# files). Conditions to WARN (ALL must hold):
+#   1. frontmatter primary_domain: contains "governance" (case-insensitive).
+#   2. frontmatter created: >= 2026-06-10 (ISO, lexical compare). Missing = skip.
+#   3. frontmatter status: is NOT shipped or cancelled.
+#   4. frontmatter has NO signal_tier: line (any value silences).
+_st_warn_count=0
+_st_warn_files=()
+shopt -s nullglob
+for _st_spec in "$ROOT"/docs/specs/*.md; do
+  [[ -f "$_st_spec" ]] || continue
+  _st_base="$(basename "$_st_spec")"
+  # Skip underscore-prefixed meta/index specs (_*.md).
+  [[ "$_st_base" == _* ]] && continue
+  # Extract YAML frontmatter (between first pair of --- lines); strip \r.
+  _st_fm="$(awk '/^---/{if(found){exit}else{found=1;next}} found{print}' "$_st_spec" | tr -d '\r')"
+  # Condition 1: primary_domain contains "governance" (case-insensitive).
+  # Use || true on grep to avoid set -e exit when grep finds no match.
+  _st_domain="$(printf '%s' "$_st_fm" | grep -i '^primary_domain:' | head -1 | sed 's/^[^:]*:[[:space:]]*//' || true)"
+  if ! printf '%s' "$_st_domain" | grep -qi 'governance'; then
+    continue
+  fi
+  # Condition 2: created: >= 2026-06-10 (lexical). Missing = grandfathered, skip.
+  _st_created="$(printf '%s' "$_st_fm" | grep '^created:' | head -1 | sed 's/^[^:]*:[[:space:]]*//' || true)"
+  if [[ -z "$_st_created" ]]; then
+    continue
+  fi
+  if [[ "$_st_created" < "2026-06-10" ]]; then
+    continue
+  fi
+  # Condition 3: status not shipped or cancelled.
+  _st_status="$(printf '%s' "$_st_fm" | grep '^status:' | head -1 | sed 's/^[^:]*:[[:space:]]*//' || true)"
+  if [[ "$_st_status" == "shipped" ]] || [[ "$_st_status" == "cancelled" ]]; then
+    continue
+  fi
+  # Condition 4: no signal_tier: line present.
+  if printf '%s' "$_st_fm" | grep -q '^signal_tier:'; then
+    continue
+  fi
+  _st_warn_files+=("$_st_base")
+  _st_warn_count=$((_st_warn_count + 1))
+done
+shopt -u nullglob
+if [[ "$_st_warn_count" -gt 0 ]]; then
+  record_result WARN "governance specs missing signal_tier frontmatter (guardrails §13 ADD-Gate): ${_st_warn_count}" || true
+  for _st_f in "${_st_warn_files[@]}"; do
+    printf '  governance spec missing signal_tier: %s\n' "$_st_f"
+  done
+else
+  record_result PASS "governance-rule specs declare signal_tier (or none apply)" || true
+fi
+
+echo ""
+printf 'Summary: pass=%s warn=%s fail=%s skip=%s\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT" "$SKIP_COUNT"
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
+  echo "Agentic OS integrity check failed"
+  exit 1
+fi
+
+# (#113) Reduced-assurance labeling. PYTHON_BIN is empty in exactly two states:
+# the --no-python flag, or python genuinely unavailable. In both, python-dependent
+# checks did not run — most importantly the gate-progression ordering/completeness
+# check degrades to a SKIP here (the native bash M9 fallback only catches a ship
+# receipt missing plan/implement, NOT one missing review/test/handoff). A clean
+# FAIL==0 run in that state has NOT verified those gates, so the top-line MUST NOT
+# claim an unqualified pass. Labeling only — exit stays 0 (not a new gate).
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  echo "Agentic OS integrity check passed (reduced assurance: python-dependent checks skipped)"
+elif [[ "$TOOL_ABSENT_UNEXPECTED" -gt 0 ]]; then
+  # Same failure class as the work-log family SKIP (backlog #149): checks that never ran
+  # must not be reported as an unqualified pass. Keyed on tool absence, which the
+  # python-only condition above is blind to. A deliberate source-only absence names itself
+  # via ACX_ABSENT_REASON and is excluded, so this never fires on a healthy downstream.
+  echo "Agentic OS integrity check passed (reduced assurance: ${TOOL_ABSENT_UNEXPECTED} referenced tool(s) absent -- those checks did not run)"
+else
+  echo "Agentic OS integrity check passed"
+fi
