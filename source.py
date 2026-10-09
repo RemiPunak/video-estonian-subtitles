@@ -27,11 +27,22 @@ def _tokens(path: Path) -> set[str]:
     return set(re.split(r"[^a-z0-9]+", path.stem.lower())) - {""}
 
 
+_SDH_RE = re.compile(r"^\s*[\[(]|^\s*-?\s*[A-Z][A-Z .']{2,}:", re.MULTILINE)
+
+
+def _looks_sdh(path: Path) -> bool:
+    """RARBG jt ei märgi SDH-d failinimes: tunneme ära helikirjelduste ([Elevator dings]) ja kõneleja siltide järgi."""
+    from srt_utils import decode
+    text = decode(path.read_bytes())
+    cues = text.count("-->")
+    return cues > 0 and len(_SDH_RE.findall(text)) / cues > 0.05
+
+
 def find_local(video: Path, lang: str) -> Path | None:
     """Otsib video kaustast ja alamkaustadest subtiitrit keeles lang ('et'/'en').
 
     Kaust kuulub videole, kui failinimi algab video nimega, alamkaust kannab video nime
-    või on video kaustas ainus (nt RARBG Subs/2_English.srt).
+    või on video kaustas ainus (nt RARBG 2_Eng.srt, Subs/2_English.srt).
     """
     root = video.parent
     stem = video.stem.lower()
@@ -44,11 +55,10 @@ def find_local(video: Path, lang: str) -> Path | None:
         rel = f.relative_to(root)
         if len(rel.parts) - 1 > MAX_SUB_DEPTH or f == own_output or "_work" in rel.parts[:-1]:
             continue
-        in_subdir = len(rel.parts) > 1
         belongs = (
             f.name.lower().startswith(stem)
             or any(p.lower() == stem for p in rel.parts[:-1])
-            or (in_subdir and sole_video)
+            or sole_video
         )
         if not belongs:
             continue
@@ -59,7 +69,7 @@ def find_local(video: Path, lang: str) -> Path | None:
             explicit = False  # Film.srt keeleta: eeldame inglise keelt nagu varem
         else:
             continue
-        hearing = bool(tokens & {"sdh", "hi", "cc"})
+        hearing = bool(tokens & {"sdh", "hi", "cc"}) or _looks_sdh(f)
         forced = "forced" in tokens
         cands.append(((not forced, explicit, not hearing, f.stat().st_size), f))
     if not cands:
