@@ -96,23 +96,33 @@ def extract_embedded(video: Path, work: Path) -> Path | None:
             print(f"  Videos on ainult pildipõhised subtiitrid ({codecs}), need jäetakse vahele.")
         return None
 
+    # Kõik tekstirajad ühe läbimisega välja: forced/SDH tunneb ära alles sisu järgi
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(video)]
+    for s in text_streams:
+        s["path"] = work / f"{video.stem}.embedded{s['index']}.srt"
+        cmd += ["-map", f"0:{s['index']}", "-c:s", "srt", str(s["path"])]
+    subprocess.run(cmd, check=True)
+    from srt_utils import decode
+    for s in text_streams:
+        s["cues"] = decode(s["path"].read_bytes()).count("-->")
+    most = max(s["cues"] for s in text_streams)
+
     def score(s: dict) -> tuple:
         tags = s.get("tags", {})
         lang = tags.get("language", "").lower()
         title = tags.get("title", "").lower()
-        forced = s.get("disposition", {}).get("forced", 0) or "forced" in title
-        return (lang in EN_LANGS, not forced, "sdh" not in title)
+        # Märkimata forced-rada (nt ainult viipekeele kohad) on täisrajast mitu korda lühem
+        forced = s.get("disposition", {}).get("forced", 0) or "forced" in title or s["cues"] < most * 0.2
+        sdh = "sdh" in title or _looks_sdh(s["path"])
+        return (lang in EN_LANGS, not forced, not sdh, s["cues"])
 
     best = max(text_streams, key=score)
     lang = best.get("tags", {}).get("language", "?")
     if lang.lower() not in EN_LANGS:
         print(f"  Hoiatus: ingliskeelset rada ei leitud, kasutan rada keelega '{lang}'.")
-    out = work / f"{video.stem}.embedded.srt"
-    subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(video), "-map", f"0:{best['index']}", "-c:s", "srt", str(out)],
-        check=True,
-    )
-    print(f"  Võtsin välja rada #{best['index']} ({best['codec_name']}, {lang}).")
+    out = best["path"]
+    sdh_note = ", SDH: helikirjeldused eemaldatakse" if _looks_sdh(out) else ""
+    print(f"  Võtsin välja rada #{best['index']} ({best['codec_name']}, {lang}, {best['cues']} repliiki{sdh_note}).")
     return out
 
 

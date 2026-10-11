@@ -32,11 +32,18 @@ def write_srt(path: Path, subs: list[srt.Subtitle]) -> None:
     path.write_text(srt.compose(subs, reindex=True), encoding="utf-8")
 
 
+_SOUND_RE = re.compile(r"\[[^\]]*\]|\([A-Z][A-Z0-9 ,.'!?-]*\)")  # [MUSIC PLAYING], (GASPS)
+_SPEAKER_RE = re.compile(r"^(-?\s*)[A-Z][A-Z0-9 .'&-]*[A-Z0-9]:\s*")  # JOHN: / - MR. SMITH:
+
+
 def clean(text: str) -> str:
-    """Eemaldab vormindustagid ja liidab read üheks lauseks tõlkimiseks."""
-    text = _TAG_RE.sub("", text)
-    text = re.sub(r"\s*\n\s*", " ", text)
-    return text.strip()
+    """Eemaldab vormindustagid ja SDH-märgendid ning liidab read üheks lauseks tõlkimiseks."""
+    text = _SOUND_RE.sub("", _TAG_RE.sub("", text))
+    lines = [_SPEAKER_RE.sub(r"\1", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line.strip("- ♪")]
+    if len(lines) == 1:
+        lines[0] = lines[0].lstrip("- ")  # dialoogi teine pool oli ainult helikirjeldus
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
 def wrap(text: str, width: int = MAX_LINE) -> str:
