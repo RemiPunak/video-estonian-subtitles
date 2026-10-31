@@ -30,7 +30,23 @@ Kui eestikeelset faili pole, valitakse tõlke lähe järgmises järjekorras:
 1. Video kaustas või alamkaustas on ingliskeelne `.srt` (`Film.en.srt`, `Film.srt`, `Subs/2_English.srt`). Eelistatakse mitte-forced ja mitte-SDH faili.
 2. Videos on ingliskeelne tekstipõhine subtiitrirada (SRT, ASS või mov_text). PGS/VobSub pilt-subtiitreid see ei kasuta.
 3. Internetist leitud ingliskeelne subtiiter, mis sünkroonitakse samamoodi.
-4. Kui midagi pole, tuvastab Whisper `large-v3` kõne GPU peal. Esimesel käivitusel laaditakse alla umbes 3 GB mudelit.
+4. Kui midagi pole, pakub skript Whisper `large-v3` kõnetuvastust GPU peal, **ainult kinnitusega** (vaikimisi ei). Esimesel käivitusel laaditakse alla umbes 3 GB mudelit.
+
+## Kogu läbimine (`--library`)
+
+```powershell
+python estsub.py --library "D:\Torrent\Video" "E:\TorrentE" --exclude "E:\TorrentE\Game"
+```
+
+Kolm faasi, kulu kasvab ja iga kulukas samm vajab kinnitust:
+
+1. **Tasuta, automaatne:** kohalik või internetist eestikeelne SRT kõigile videotele. Vahele jäävad videod, millel on juba `.et.srt` või mille heli on eesti keeles.
+2. **Tõlge (üks kinnitus kogu partii kohta):** näitab nimekirja ja küsib `[j/N]`. `--yes-translate` kinnitab selle automaatselt.
+3. **Whisper kõnetuvastus (kinnitus filmi kaupa):** näitab kestust ja hinnangulist aega. Automaatselt **ei käivitu kunagi**, ka mitte mitte-interaktiivses keskkonnas, ja sellele pole `--yes` lippu.
+
+Ühe filmi režiimis (paremklõps) kehtib Whisperi kohta sama kinnitus.
+
+Testid: `python -m unittest tests.test_cascade -v`
 
 ## Ühe klikiga (Exploreri paremklikk)
 

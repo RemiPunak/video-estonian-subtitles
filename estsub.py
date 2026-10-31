@@ -3,6 +3,7 @@
 Kasutus:
     python estsub.py "D:\\Filmid\\Film (2020)\\Film.mkv"
     python estsub.py film.mkv --source film.en.srt --engine deepl
+    python estsub.py --library "D:\\Torrent\\Video" "E:\\TorrentE" --exclude "E:\\TorrentE\\Game"
 """
 from __future__ import annotations
 
@@ -15,9 +16,10 @@ import tempfile
 from pathlib import Path
 
 import srt_utils
-from source import find_local, get_source
+from source import WhisperNeeded, find_local, get_source, is_estonian_audio
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
+
 
 def movie_title(video: Path) -> str:
     # Plexi kausta nimi on tavaliselt "Pealkiri (aasta)"
@@ -25,31 +27,46 @@ def movie_title(video: Path) -> str:
     return re.sub(r"[._]", " ", name)
 
 
-def process(video: Path, args: argparse.Namespace) -> None:
-    out = video.with_name(video.stem + ".et.srt")
-    if out.exists() and not args.force:
-        print(f"{out.name} on juba olemas (--force kirjutab üle).")
-        return
-    print(f"\n=== {video.name} ===")
+def out_path(video: Path) -> Path:
+    return video.with_name(video.stem + ".et.srt")
 
-    if not args.source and (local_et := find_local(video, "et")):
+
+def confirm(question: str) -> bool:
+    """Küsib jah/ei. Vaikimisi EI; mitte-interaktiivses keskkonnas alati EI."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{question} [j/N] ").strip().lower() in {"j", "jah", "y", "yes"}
+    except EOFError:
+        return False
+
+
+def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict | None) -> bool:
+    """1. samm (tasuta): kohalik või internetist valmis eestikeelne SRT. True = fail kirjutatud."""
+    out = out_path(video)
+    if local_et := find_local(video, "et"):
         et = srt_utils.read_srt(local_et)
         srt_utils.write_srt(out, [_rewrap(s) for s in et])
         print(f"Valmis (kohalik eestikeelne {local_et.relative_to(video.parent)}, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
-        return
-
-    online_cache = None if args.no_online else {}
-    if online_cache is not None and not args.source:
+        return True
+    if online_cache is not None:
         import online
         print("Otsin internetist valmis eestikeelseid subtiitreid...")
         if et := online.find_synced(video, "est", online_cache):
             srt_utils.write_srt(out, [_rewrap(s) for s in et])
             print(f"Valmis (internetist, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
-            return
+            return True
+    return False
 
+
+def translate_video(video: Path, args: argparse.Namespace, online_cache: dict | None,
+                    allow_whisper: bool = False) -> None:
+    """2. samm: lähtetekst (inglise) -> DeepL -> Claude. Tõstab WhisperNeeded, kui allikat pole
+    ja allow_whisper on False."""
+    out = out_path(video)
     work = Path(tempfile.mkdtemp(prefix="estsub_"))
     try:
-        src_path = get_source(video, work, args.source, online_cache)
+        src_path = get_source(video, work, args.source, online_cache, allow_whisper=allow_whisper)
         subs = srt_utils.read_srt(src_path)
         if not subs:
             raise SystemExit("Lähtesubtiitrid on tühjad.")
@@ -79,6 +96,43 @@ def process(video: Path, args: argparse.Namespace) -> None:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def whisper_estimate(video: Path) -> str:
+    from source import duration_seconds
+    mins = duration_seconds(video) / 60
+    # large-v3 GPU peal umbes 8x reaalajast + mudeli laadimine; CPU on mitu korda aeglasem
+    return f"film {mins:.0f} min, hinnanguliselt {mins / 8:.0f}-{mins / 4:.0f} min GPU-l (esimesel korral +3 GB mudeli allalaadimine)"
+
+
+def ask_whisper(video: Path) -> bool:
+    """Whisper on kallis: käivitub ainult selge jah-vastusega, filmi kaupa."""
+    print(f"  Tasuta lähtesubtiitreid ei leitud: {video.name}")
+    print(f"  Kõnetuvastus Whisperiga: {whisper_estimate(video)}.")
+    return confirm("  Kas käivitan kõnetuvastuse?")
+
+
+def process(video: Path, args: argparse.Namespace) -> None:
+    """Ühe video töö (paremklõps): tasuta samm, tõlge, vajadusel kinnitatud Whisper."""
+    out = out_path(video)
+    if out.exists() and not args.force:
+        print(f"{out.name} on juba olemas (--force kirjutab üle).")
+        return
+    print(f"\n=== {video.name} ===")
+    if not args.force and not args.source and is_estonian_audio(video):
+        print("Filmi heli on eesti keeles, subtiitreid pole vaja.")
+        return
+
+    online_cache = None if args.no_online else {}
+    if not args.source and try_free_estonian(video, args, online_cache):
+        return
+    try:
+        translate_video(video, args, online_cache, allow_whisper=False)
+    except WhisperNeeded:
+        if not ask_whisper(video):
+            print("Whisperit ei käivitatud. Subtiitreid ei tehtud.")
+            raise SystemExit(1)
+        translate_video(video, args, online_cache, allow_whisper=True)
+
+
 def _rewrap(s):
     # Inimese tehtud subtiitri reamurrud jäävad alles, murrame ainult üle pika rea
     if any(len(line) > srt_utils.MAX_LINE + 8 for line in s.content.splitlines()):
@@ -98,7 +152,11 @@ def _apply(subs, texts: dict[int, str]):
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Eestikeelsed subtiitrid Plexi jaoks (DeepL + Claude).")
-    p.add_argument("video", type=Path, help="videofail või kaust (töötleb kausta videod, alamkaustu mitte)")
+    p.add_argument("video", type=Path, nargs="?", help="videofail või kaust (töötleb kausta videod, alamkaustu mitte)")
+    p.add_argument("--library", type=Path, nargs="+", metavar="JUUR",
+                   help="käi läbi terve kogu (rekursiivselt), kolm faasi kinnitustega")
+    p.add_argument("--exclude", type=Path, action="append", default=[], help="kaust, mida kogu läbimisel ei puudutata")
+    p.add_argument("--yes-translate", action="store_true", help="kogu läbimisel kinnita tõlge automaatselt (Whisperile sellist lippu pole)")
     p.add_argument("--source", type=Path, help="kasuta seda ingliskeelset SRT faili")
     p.add_argument("--engine", choices=["hybrid", "deepl"], default="hybrid")
     p.add_argument("--model", default="claude-sonnet-5-5", help="Claude Code mudel järeltoimetuseks")
@@ -109,6 +167,13 @@ def main() -> None:
 
     if sys.stdout.encoding.lower() != "utf-8":
         sys.stdout.reconfigure(encoding="utf-8")
+
+    if args.library:
+        import library
+        library.run(args)
+        return
+    if not args.video:
+        p.error("anna videofail/kaust või --library JUUR")
 
     target: Path = args.video
     if target.is_dir():

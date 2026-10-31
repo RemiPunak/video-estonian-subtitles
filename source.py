@@ -204,8 +204,41 @@ def transcribe(video: Path, work: Path, model_size: str = "large-v3") -> Path:
     return out
 
 
-def get_source(video: Path, work: Path, explicit: Path | None, online_cache: dict | None = None) -> Path:
-    """online_cache=None lülitab internetiotsingu välja."""
+class WhisperNeeded(Exception):
+    """Ühtegi tasuta lähtesubtiitrit pole; ainus võimalus on kallis Whisperi kõnetuvastus."""
+
+
+def audio_language(video: Path) -> str:
+    """Esimese helitrajekti keelekood ffprobe'i järgi (väiketähed) või '' kui märkimata."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream_tags=language",
+         "-of", "default=nw=1:nk=1", str(video)],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    lang = out.stdout.strip().lower()
+    return "" if lang in {"und", "unknown"} else lang
+
+
+def is_estonian_audio(video: Path) -> bool:
+    return audio_language(video) in {"est", "et"}
+
+
+def duration_seconds(video: Path) -> float:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(video)],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    try:
+        return float(out.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def get_source(video: Path, work: Path, explicit: Path | None, online_cache: dict | None = None,
+               allow_whisper: bool = False) -> Path:
+    """online_cache=None lülitab internetiotsingu välja.
+
+    Whisper käivitub ainult allow_whisper=True korral; muidu tõstetakse WhisperNeeded."""
     if explicit:
         print(f"Lähe: {explicit}")
         return explicit
@@ -223,5 +256,7 @@ def get_source(video: Path, work: Path, explicit: Path | None, online_cache: dic
             out = work / f"{video.stem}.online.en.srt"
             srt_utils.write_srt(out, subs)
             return out
-    print("Subtiitreid pole, tuvastan kõne Whisperiga...")
+    if not allow_whisper:
+        raise WhisperNeeded(video)
+    print("Subtiitreid pole, tuvastan kõne Whisperiga (kinnitatud)...")
     return transcribe(video, work)
