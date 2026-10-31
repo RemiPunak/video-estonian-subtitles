@@ -98,6 +98,41 @@ class LibraryPhases(unittest.TestCase):
         self.assertTrue(estsub.translate_video.call_args.kwargs["allow_whisper"])
 
 
+class PlexRefresh(unittest.TestCase):
+    XML = (
+        '<MediaContainer>'
+        '<Directory key="1"><Location path="D:\\Torrent\\Video"/></Directory>'
+        '<Directory key="2"><Location path="E:\\TorrentE\\Film"/></Directory>'
+        '</MediaContainer>'
+    )
+
+    def test_section_for_path_picks_matching_library(self):
+        import plex
+        self.assertEqual(plex.section_for_path(self.XML, Path("D:/Torrent/Video/Arze (2024)")), "1")
+        self.assertEqual(plex.section_for_path(self.XML, Path("E:/TorrentE/Film/X")), "2")
+        self.assertIsNone(plex.section_for_path(self.XML, Path("E:/TorrentE/Game/X")))
+
+    def test_refresh_without_token_makes_no_request(self):
+        import plex
+        with mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch.object(plex, "_request") as req:
+            self.assertFalse(plex.refresh_folder(Path("D:/Torrent/Video/X")))
+            req.assert_not_called()
+
+    def test_token_goes_in_header_not_url(self):
+        import plex
+        calls = []
+        def fake(url, token):
+            calls.append((url, token))
+            return self.XML.encode() if url.endswith("/library/sections") else b""
+        with mock.patch.dict("os.environ", {"PLEX_TOKEN": "SECRET"}, clear=True), \
+                mock.patch.object(plex, "_request", side_effect=fake):
+            self.assertTrue(plex.refresh_folder(Path("D:/Torrent/Video/X")))
+        self.assertTrue(all("SECRET" not in url for url, _ in calls))
+        self.assertTrue(all(tok == "SECRET" for _, tok in calls))
+        self.assertIn("/library/sections/1/refresh?", calls[-1][0])
+
+
 class ConfirmNonInteractive(unittest.TestCase):
     def test_ac3_confirm_is_false_without_tty(self):
         import estsub

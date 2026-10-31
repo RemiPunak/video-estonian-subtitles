@@ -41,6 +41,12 @@ def confirm(question: str) -> bool:
         return False
 
 
+def refresh_plex(video: Path, args: argparse.Namespace) -> None:
+    if not getattr(args, "no_plex", False):
+        import plex
+        plex.refresh_folder(video.parent)
+
+
 def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict | None) -> bool:
     """1. samm (tasuta): kohalik või internetist valmis eestikeelne SRT. True = fail kirjutatud."""
     out = out_path(video)
@@ -48,6 +54,7 @@ def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict 
         et = srt_utils.read_srt(local_et)
         srt_utils.write_srt(out, [_rewrap(s) for s in et])
         print(f"Valmis (kohalik eestikeelne {local_et.relative_to(video.parent)}, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
+        refresh_plex(video, args)
         return True
     if online_cache is not None:
         import online
@@ -55,6 +62,7 @@ def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict 
         if et := online.find_synced(video, "est", online_cache):
             srt_utils.write_srt(out, [_rewrap(s) for s in et])
             print(f"Valmis (internetist, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
+            refresh_plex(video, args)
             return True
     return False
 
@@ -92,6 +100,7 @@ def translate_video(video: Path, args: argparse.Namespace, online_cache: dict | 
         srt_utils.write_srt(out, result)
         changed = sum(1 for i in final if final[i] != draft[i])
         print(f"Valmis: {out}  ({len(result)} subtiitrit, Claude muutis {changed} rida)")
+        refresh_plex(video, args)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -161,6 +170,7 @@ def main() -> None:
     p.add_argument("--engine", choices=["hybrid", "deepl"], default="hybrid")
     p.add_argument("--model", default="claude-sonnet-5-5", help="Claude Code mudel järeltoimetuseks")
     p.add_argument("--no-online", action="store_true", help="ära otsi subtiitreid internetist")
+    p.add_argument("--no-plex", action="store_true", help="ära käivita Plexi uuendust pärast subtiitrite kirjutamist")
     p.add_argument("--force", action="store_true", help="kirjuta olemasolev .et.srt üle")
     p.add_argument("--keep-intermediate", action="store_true", help="salvesta vahefailid kausta _work/")
     args = p.parse_args()

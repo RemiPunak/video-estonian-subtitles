@@ -56,6 +56,17 @@ powershell -ExecutionPolicy Bypass -File install_context_menu.ps1
 ```
 Seejärel tee filmi kaustas tühjal alal, kausta peal või videofaili peal paremklikk → **Show more options** → **Tee eesti subtiitrid**. Avaneb aken, kus on näha töö käik. Eemaldamine: lisa käsule lipp `-Uninstall`.
 
+## Plexi automaatne uuendus
+
+Pärast `.et.srt` kirjutamist käivitab skript Plexi osalise skannimise filmi kaustale, nii et subtiitrid on kohe nähtavad. Seadistus (ühekordne):
+
+```powershell
+setx PLEX_TOKEN "sinu-plexi-token"      # token ei satu logisse ega URL-i; ava pärast uus terminal
+# valikuline: setx PLEX_URL "http://127.0.0.1:32400"
+```
+
+Ilma `PLEX_TOKEN`-ita jääb uuendus tegemata (Plexi enda automaatne skannimine leiab muudatuse ise). Lipp `--no-plex` lülitab uuenduse välja. Nutikad kollektsioonid uuenevad Plexis ise.
+
 ## Plex
 
 1. Settings → Agents (või raamatukogu seaded) → **Local Media Assets** peab olema sisse lülitatud.
