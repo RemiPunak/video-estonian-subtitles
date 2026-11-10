@@ -38,3 +38,4 @@ _work/
 
 # End Agentic OS Template - Downstream Ignore Defaults
 
+.chrome_profile/

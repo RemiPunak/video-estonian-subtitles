@@ -56,9 +56,29 @@ powershell -ExecutionPolicy Bypass -File install_context_menu.ps1
 ```
 Seejärel tee filmi kaustas tühjal alal, kausta peal või videofaili peal paremklikk → **Show more options** → **Tee eesti subtiitrid**. Avaneb aken, kus on näha töö käik. Eemaldamine: lisa käsule lipp `-Uninstall`.
 
+## Liigutamine pärast tõlget
+
+Kui `.et.srt` on lisatud (kohalik, internetist või tõlgitud), liigutatakse video koos oma kõrvalfailidega (`Film.*`) kausta `D:\Torrent\Video\Films-with-estonian-subtitles`. Olemasolevat faili ei kirjutata üle (konflikti korral jääb video paigale). Kaust muutub lipuga `--dest`, liigutamise saab välja lülitada lipuga `--no-move`.
+
+## Üleslaadimine OpenSubtitlesi (`--upload`)
+
+opensubtitles.com-il veebis üleslaadimist pole; laadime üles opensubtitles.org-i, kust fail ilmub .com-is sama konto all automaatselt. Ühekordne seadistus:
+
+```powershell
+powershell -File start_chrome_os.ps1   # eraldi Chrome profiil pordiga 9222; logi seal opensubtitles.org-i sisse
+```
+
+Tavabrauseri sisselogimist ei saa taaskasutada (Chrome ei luba porti vaikeprofiilil). Kasutus:
+
+```powershell
+python estsub.py "D:\Torrent\Video\Films-with-estonian-subtitles\Film.mkv" --upload --imdb tt1234567
+```
+
+Skript täidab vormi (est, IMDB ID, FPS, release, masintõlke märge ja kommentaar) ja küsib filmi kaupa `[j/N]`. Mitte-interaktiivses keskkonnas ei saada midagi. Juba üles laaditud failid (`uploaded.json`) jäetakse vahele; `--force` laeb uuesti.
+
 ## Plexi automaatne uuendus
 
-Pärast `.et.srt` kirjutamist käivitab skript Plexi osalise skannimise filmi kaustale, nii et subtiitrid on kohe nähtavad. Seadistus (ühekordne):
+Pärast `.et.srt` kirjutamist (ja liigutamist) käivitab skript Plexi osalise skannimise filmi kaustale, nii et subtiitrid on kohe nähtavad. Seadistus (ühekordne):
 
 ```powershell
 setx PLEX_TOKEN "sinu-plexi-token"      # token ei satu logisse ega URL-i; ava pärast uus terminal

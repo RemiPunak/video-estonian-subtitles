@@ -7,6 +7,8 @@ from pathlib import Path
 
 import srt
 
+import adclean
+
 MAX_LINE = 42
 
 _TAG_RE = re.compile(r"</?(?:i|b|u|font)[^>]*>|\{\\[^}]*\}", re.IGNORECASE)
@@ -29,7 +31,7 @@ def read_srt(path: Path) -> list[srt.Subtitle]:
 
 
 def write_srt(path: Path, subs: list[srt.Subtitle]) -> None:
-    path.write_text(srt.compose(subs, reindex=True), encoding="utf-8")
+    path.write_text(srt.compose(adclean.strip_ad_cues(subs), reindex=True), encoding="utf-8")
 
 
 _SOUND_RE = re.compile(r"\[[^\]]*\]|\([A-Z][A-Z0-9 ,.'!?-]*\)")  # [MUSIC PLAYING], (GASPS)

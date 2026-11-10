@@ -19,6 +19,7 @@ import srt_utils
 from source import WhisperNeeded, find_local, get_source, is_estonian_audio
 
 VIDEO_EXT = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts"}
+DEST_DIR = r"D:\Torrent\Video\Films-with-estonian-subtitles"
 
 
 def movie_title(video: Path) -> str:
@@ -47,6 +48,30 @@ def refresh_plex(video: Path, args: argparse.Namespace) -> None:
         plex.refresh_folder(video.parent)
 
 
+def move_to_dest(video: Path, args: argparse.Namespace) -> Path:
+    """Liigutab video koos selle kõrval olevate failidega (`<nimi>.*`, sh `.et.srt`) sihtkausta.
+    Tagastab video uue asukoha; olemasolevat faili ei kirjutata kunagi üle."""
+    dest = Path(getattr(args, "dest", None) or DEST_DIR)
+    if getattr(args, "no_move", False) or video.parent.resolve() == dest.resolve():
+        return video
+    files = [f for f in video.parent.iterdir()
+             if f.is_file() and (f == video or f.name.startswith(video.stem + "."))]
+    clash = [f.name for f in files if (dest / f.name).exists()]
+    if clash:
+        print(f"  Liigutamata: sihtkaustas on juba {', '.join(clash)} ({dest}).")
+        return video
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        shutil.move(str(f), str(dest / f.name))
+    print(f"  Liigutatud koos tõlkega: {dest / video.name}")
+    return dest / video.name
+
+
+def finish(video: Path, args: argparse.Namespace) -> None:
+    """Pärast .et.srt kirjutamist: liiguta sihtkausta ja uuenda Plex."""
+    refresh_plex(move_to_dest(video, args), args)
+
+
 def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict | None) -> bool:
     """1. samm (tasuta): kohalik või internetist valmis eestikeelne SRT. True = fail kirjutatud."""
     out = out_path(video)
@@ -54,7 +79,7 @@ def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict 
         et = srt_utils.read_srt(local_et)
         srt_utils.write_srt(out, [_rewrap(s) for s in et])
         print(f"Valmis (kohalik eestikeelne {local_et.relative_to(video.parent)}, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
-        refresh_plex(video, args)
+        finish(video, args)
         return True
     if online_cache is not None:
         import online
@@ -62,7 +87,7 @@ def try_free_estonian(video: Path, args: argparse.Namespace, online_cache: dict 
         if et := online.find_synced(video, "est", online_cache):
             srt_utils.write_srt(out, [_rewrap(s) for s in et])
             print(f"Valmis (internetist, tõlget polnud vaja): {out}  ({len(et)} subtiitrit)")
-            refresh_plex(video, args)
+            finish(video, args)
             return True
     return False
 
@@ -100,7 +125,7 @@ def translate_video(video: Path, args: argparse.Namespace, online_cache: dict | 
         srt_utils.write_srt(out, result)
         changed = sum(1 for i in final if final[i] != draft[i])
         print(f"Valmis: {out}  ({len(result)} subtiitrit, Claude muutis {changed} rida)")
-        refresh_plex(video, args)
+        finish(video, args)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -171,6 +196,11 @@ def main() -> None:
     p.add_argument("--model", default="claude-sonnet-5-5", help="Claude Code mudel järeltoimetuseks")
     p.add_argument("--no-online", action="store_true", help="ära otsi subtiitreid internetist")
     p.add_argument("--no-plex", action="store_true", help="ära käivita Plexi uuendust pärast subtiitrite kirjutamist")
+    p.add_argument("--dest", type=Path, default=Path(DEST_DIR), help="kuhu video koos tõlkega liigutatakse")
+    p.add_argument("--no-move", action="store_true", help="ära liiguta videot pärast tõlke lisamist")
+    p.add_argument("--upload", action="store_true",
+                   help="laadi olemasolev .et.srt üles opensubtitles.org-i (filmi kaupa kinnitusega); ei tõlgi")
+    p.add_argument("--imdb", help="filmi IMDB ID üleslaadimiseks (nt tt1234567)")
     p.add_argument("--force", action="store_true", help="kirjuta olemasolev .et.srt üle")
     p.add_argument("--keep-intermediate", action="store_true", help="salvesta vahefailid kausta _work/")
     args = p.parse_args()
@@ -200,6 +230,12 @@ def main() -> None:
         videos = [target]
     else:
         raise SystemExit(f"Faili ei leitud: {target}")
+    if args.upload:
+        import upload
+        for v in videos:
+            print(f"\n=== {v.name} ===")
+            upload.upload_video(v, args, confirm)
+        return
     for v in videos:
         process(v, args)
 
