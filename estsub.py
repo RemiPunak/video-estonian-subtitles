@@ -99,7 +99,7 @@ def translate_video(video: Path, args: argparse.Namespace, online_cache: dict | 
     out = out_path(video)
     work = Path(tempfile.mkdtemp(prefix="estsub_"))
     try:
-        src_path = get_source(video, work, args.source, online_cache, allow_whisper=allow_whisper)
+        src_path, src_lang = get_source(video, work, args.source, online_cache, allow_whisper=allow_whisper)
         subs = srt_utils.read_srt(src_path)
         if not subs:
             raise SystemExit("Lähtesubtiitrid on tühjad.")
@@ -108,12 +108,12 @@ def translate_video(video: Path, args: argparse.Namespace, online_cache: dict | 
         print(f"Subtiitreid: {len(source)}, märke: {sum(map(len, source.values())):,}")
 
         from translate_deepl import translate
-        draft = translate(source)
+        draft = translate(source, src_lang)
 
         final = draft
         if args.engine == "hybrid":
             from polish_claude import polish
-            final = polish(source, draft, movie_title(video), model=args.model)
+            final = polish(source, draft, movie_title(video), model=args.model, source_lang=src_lang)
 
         if args.keep_intermediate:
             keep = video.parent / "_work"

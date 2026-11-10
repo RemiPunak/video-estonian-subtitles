@@ -19,8 +19,8 @@ def _translator() -> deepl.Translator:
     return deepl.Translator(key)
 
 
-def translate(texts: dict[int, str]) -> dict[int, str]:
-    """texts: {id: ingliskeelne tekst} -> {id: eestikeelne tekst}."""
+def translate(texts: dict[int, str], source_lang: str = "EN") -> dict[int, str]:
+    """texts: {id: võõrkeelne tekst} -> {id: eestikeelne tekst}."""
     tr = _translator()
     ids = list(texts)
     result: dict[int, str] = {}
@@ -31,14 +31,14 @@ def translate(texts: dict[int, str]) -> dict[int, str]:
         xml_context = html.escape(context, quote=False) if context else None  # tag_handling=xml parsib ka konteksti
         xml = "".join(f'<c id="{i}">{html.escape(texts[i], quote=False)}</c>' for i in chunk)
         res = tr.translate_text(
-            xml, source_lang="EN", target_lang="ET", tag_handling="xml",
+            xml, source_lang=source_lang, target_lang="ET", tag_handling="xml",
             context=xml_context, preserve_formatting=True,
             outline_detection=False, split_sentences="nonewlines",
         )
         got = {int(m.group(1)): html.unescape(m.group(2)).strip() for m in _SEG_RE.finditer(res.text)}
         missing = [i for i in chunk if not got.get(i)]
         for i in missing:  # DeepL liitis või kaotas tagi: tõlgime selle rea eraldi
-            got[i] = tr.translate_text(texts[i], source_lang="EN", target_lang="ET", context=context).text
+            got[i] = tr.translate_text(texts[i], source_lang=source_lang, target_lang="ET", context=context).text
         result.update({i: got[i] for i in chunk})
         print(f"  DeepL: {min(start + BATCH, len(ids))}/{len(ids)}" + (f" ({len(missing)} eraldi)" if missing else ""))
     usage = tr.get_usage()

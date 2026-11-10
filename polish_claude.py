@@ -100,6 +100,7 @@ def polish(
     draft: dict[int, str],
     title: str,
     model: str = DEFAULT_MODEL,
+    source_lang: str = "EN",
 ) -> dict[int, str]:
     cmd = _claude_cmd(model)
     ids = list(draft)
@@ -112,7 +113,8 @@ def polish(
             "eelnev_kontekst_ainult_lugemiseks": [{"en": source[i], "et": result[i]} for i in prev],
             "toimeta": [{"id": i, "en": source[i], "et": draft[i]} for i in chunk],
         }
-        prompt = f"Film: {title}\n\n" + json.dumps(payload, ensure_ascii=False, indent=1)
+        note = "" if source_lang == "EN" else f"Originaal (väli \"en\") on DeepL-i keelekoodiga {source_lang}, mitte inglise keeles.\n"
+        prompt = f"Film: {title}\n{note}\n" + json.dumps(payload, ensure_ascii=False, indent=1)
         out, err = _ask(cmd, prompt)
         if out is None:
             out, err = _ask(cmd, prompt)  # üks kordus
